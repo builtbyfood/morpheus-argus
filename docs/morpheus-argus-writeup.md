@@ -188,7 +188,7 @@ Per-host labels in Morpheus (free-form `key:value` tags):
 After saving labels, refresh the host page — the iLO tab appears and
 the status panel populates.
 
-> [![Host-Labels](./docs/screenshots/labels.png)]
+> [![Host-Labels](./screenshots/labels.png)]
 
 No role grants are required. No custom permissions are declared.
 
