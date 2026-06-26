@@ -55,7 +55,7 @@ Tested against:
 
 ---
 
-## Install by building or using the presented JAR file
+## Install by building or using the presented JAR file located here: https://github.com/builtbyfood/morpheus-argus
 
 1. **Build** the JAR locally:
    ```bash
