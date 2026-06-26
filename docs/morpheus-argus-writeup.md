@@ -8,7 +8,7 @@ copy/paste, and launches the IRC HTML5 console in one click,
 pre-authenticated, in a new window. Repo:
 [`github.com/builtbyfood/morpheus-argus`](https://github.com/builtbyfood/morpheus-argus).
 
-> [![iLO-Tab](screenshots/details1.png)] 
+> [![iLO-Tab](screenshots/ilo-details1.png)] 
 
 ---
 
@@ -51,8 +51,8 @@ that's already stored in Morpheus's Trust → Credentials.
 | **Recent Events** (collapsible) | Last 5 Integrated Management Log entries with severity coloring |
 | **Buttons** | Show credentials · ▶ Launch Console · → Open Console |
 
-> [![iLO-Tab2](screenshots/details2.png)]
-> [![iLO-Tab3](screenshots/details3.png)]
+> [![iLO-Tab2](screenshots/ilo-details2.png)]
+> [![iLO-Tab3](screenshots/ilo-details3.png)]
 
 Every card is independent. If one Redfish endpoint is missing, slow, or
 returns malformed data, that card alone is skipped — the rest of the
@@ -117,7 +117,7 @@ text/plain JSON injection, the CSS-only credential toggle, the
 absence of controller routes — is there because of one of those five
 constraints.
 
-> [![iLO-Diag](./docs/screenshots/json-console.png)]
+> [![iLO-Diag](screenshots/json-console.png)]
 
 ---
 
@@ -143,7 +143,7 @@ that card hides. If a sort closure trips over a sensor with a null
 name, the partial-data error is surfaced in a Diagnostics row instead
 of blanking the whole tab.
 
-> [![iLO-Diag](./docs/screenshots/diag.png)]
+> [![iLO-Diag](screenshots/diag.png)]
 
 ---
 
