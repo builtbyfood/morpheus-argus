@@ -1,2 +1,36 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Treat everything as text by default and let Git normalize line endings.
+* text=auto eol=lf
+
+# Windows scripts must keep CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Unix scripts must keep LF.
+*.sh    text eol=lf
+gradlew text eol=lf
+
+# Source files — explicit LF.
+*.groovy   text eol=lf
+*.java     text eol=lf
+*.gradle   text eol=lf
+*.properties text eol=lf
+*.md       text eol=lf
+*.hbs      text eol=lf
+*.html     text eol=lf
+*.css      text eol=lf
+*.js       text eol=lf
+*.svg      text eol=lf
+
+# Binary blobs.
+*.jar   binary
+*.war   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.tgz   binary
+*.pdf   binary

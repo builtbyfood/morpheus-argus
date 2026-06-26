@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+    <rect x="6" y="14" width="52" height="36" rx="3" stroke="currentColor" stroke-width="2.5"/>
+    <line x1="6" y1="24" x2="58" y2="24" stroke="currentColor" stroke-width="2"/>
+    <circle cx="12" cy="19" r="1.4" fill="currentColor"/>
+    <circle cx="16" cy="19" r="1.4" fill="currentColor"/>
+    <circle cx="20" cy="19" r="1.4" fill="currentColor"/>
+    <text x="32" y="40" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="9" font-weight="700" fill="currentColor" letter-spacing="0.5">iLO</text>
+    <line x1="14" y1="56" x2="50" y2="56" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    <line x1="20" y1="60" x2="44" y2="60" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+</svg>
