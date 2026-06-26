@@ -8,7 +8,7 @@ copy/paste, and launches the IRC HTML5 console in one click,
 pre-authenticated, in a new window. Repo:
 [`github.com/builtbyfood/morpheus-argus`](https://github.com/builtbyfood/morpheus-argus).
 
-> [![iLO-Tab](./docs/screenshots/details1.png)] 
+> [![iLO-Tab](screenshots/details1.png)] 
 
 ---
 
@@ -51,8 +51,8 @@ that's already stored in Morpheus's Trust → Credentials.
 | **Recent Events** (collapsible) | Last 5 Integrated Management Log entries with severity coloring |
 | **Buttons** | Show credentials · ▶ Launch Console · → Open Console |
 
-> [![iLO-Tab2](./docs/screenshots/details2.png)]
-> [![iLO-Tab3](./docs/screenshots/details3.png)]
+> [![iLO-Tab2](screenshots/details2.png)]
+> [![iLO-Tab3](screenshots/details3.png)]
 
 Every card is independent. If one Redfish endpoint is missing, slow, or
 returns malformed data, that card alone is skipped — the rest of the
