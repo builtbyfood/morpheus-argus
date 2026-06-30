@@ -247,15 +247,10 @@ Not yet implemented, in priority order:
 2. **Configuration UI** — replace label-driven config with a real
    plugin option-type form. Mostly polish; labels work and have
    their own advantages (scriptable, bulk-settable, searchable).
-3. **Indicator LED toggle** — single button in the System card to
-   flip the chassis identifier LED on/off via `PATCH /Chassis/1`.
-   Useful when you're physically at the rack identifying a specific
-   server. Blocked on solving the controller 403, since this is a
-   write action and can't go through the browser.
-4. **Multi-iLO inventory view** — a separate dashboard provider that
+3. **Multi-iLO inventory view** — a separate dashboard provider that
    lists all iLO-managed hosts with summary status, so you can see
    what's healthy across the fleet without clicking into each host.
-5. **Per-port traffic counters** — `NetworkPort.Oem.Hpe.PortStatistics`
+4. **Per-port traffic counters** — `NetworkPort.Oem.Hpe.PortStatistics`
    into a small chart on the Network Adapters card.
 
 ---
