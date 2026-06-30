@@ -74,6 +74,21 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
             Map status = null
             String errorMsg = null
             String credSource = null
+            // v0.1.38 — UID indicator LED action. Buttons in the System
+            // card's UID cell navigate to ?argusUidAction=Off|Lit|Blinking.
+            // We pick it up here via the same RequestContextHolder trick
+            // we use for the CSP nonce and forward it to collectStatus,
+            // which does the PATCH after login and before the bulk reads.
+            // Whitelist the value defensively — anything outside the
+            // accepted set is ignored (no PATCH, no error banner). The
+            // nonce'd JS at the bottom of the tab strips the param from
+            // the URL via history.replaceState after render so a browser
+            // refresh doesn't re-fire the action.
+            String uidAction = null
+            try {
+                String raw = getRequestParam('argusUidAction')
+                if (raw in ['Off', 'Lit', 'Blinking']) uidAction = raw
+            } catch (Throwable ignored) {}
             if (cfg.configured) {
                 Map credResult = com.morpheusdata.iloconsole.services.IloCredentialService.loadCredential(morpheusContext, cfg.credentialId as Long)
                 if (credResult?.error) {
@@ -83,7 +98,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     credSource = credResult.source
                     try {
                         RedfishClient client = new RedfishClient(cfg.iloHost as String, cfg.verifySsl as boolean)
-                        status = client.collectStatus(credResult.username as String, credResult.password as String)
+                        status = client.collectStatus(credResult.username as String, credResult.password as String, uidAction)
                         if (status?.success) {
                             status.powerClass = (status.powerState == 'On') ? 'ok' : 'bad'
                             status.healthClass = (status.health == 'OK') ? 'ok' : 'warn'
@@ -127,7 +142,223 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
             // pastes credentials into iLO's own login page; the popup is
             // same-origin with iLO from there and /irc.html WebSocket works.
             StringBuilder html = new StringBuilder()
-            html.append('<div style="padding:0; font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif; color:#dbe6ef; font-size:13px;">')
+
+            // ── v0.1.36 / v0.1.37 — Theme variables (light-mode fix) ────
+            //
+            // v0.1.36 bug fixed in 0.1.37: the dark-mode variable
+            // declarations were self-referential
+            // (`--argus-bg-card: var(--argus-bg-card)`) due to an over-
+            // aggressive sed pass during the v0.1.36 light-mode work.
+            // The browser ignored the recursive declarations and resolved
+            // them to nothing, which made card backgrounds disappear in
+            // dark mode (saved by Morpheus's dark page bg showing through).
+            // 0.1.37 restores the literal rgba values for dark-mode.
+            //
+            // v0.1.36 also missed Morpheus 9's actual theme class — none
+            // of body.theme-light, body.light-theme, body[data-theme],
+            // html.theme-light, html.light, .theme-light matched — so the
+            // variable stayed on dark-mode values rendering as pale text
+            // on white. v0.1.37 adds a CSP-nonced JS snippet that reads
+            // body's computed background brightness and sets
+            // data-mode="light"|"dark" on the .argus-tab wrapper. CSS
+            // then switches reliably regardless of how Morpheus
+            // implements its theme.
+            //
+            // Light-mode base text is strengthened from v0.1.36's #1a2530
+            // to pure black (#000) so the heavily-used opacity:0.55
+            // inline styles for label text still read with good contrast.
+            // Additional CSS rules below boost specific inline opacity
+            // values in light mode via attribute-substring matching.
+            //
+            // Status colors (#28a745, #ffc107, #d9534f, #01A982, #3b9eff)
+            // are intentionally NOT variabilized — they carry semantic
+            // meaning and must stay color-coded regardless of theme.
+            html.append('<style>')
+            // Dark theme (default) — values match v0.1.35 exactly.
+            html.append('.argus-tab {')
+            html.append('--argus-text:#dbe6ef;')
+            html.append('--argus-bg-card:rgba(255,255,255,0.02);')
+            html.append('--argus-bg-header:rgba(255,255,255,0.03);')
+            html.append('--argus-bg-pill:rgba(255,255,255,0.05);')
+            html.append('--argus-border:rgba(255,255,255,0.06);')
+            html.append('--argus-border-soft:rgba(255,255,255,0.04);')
+            html.append('--argus-bg-diag:rgba(255,255,255,0.01);')
+            html.append('--argus-btn-border:rgba(255,255,255,0.15);')
+            html.append('}')
+            // Light theme overrides — match every Morpheus theme class
+            // pattern we have seen, AND the JS-set data-mode="light"
+            // attribute (the reliable detection path).
+            html.append('body.theme-light .argus-tab,')
+            html.append('body.light-theme .argus-tab,')
+            html.append('body[data-theme="light"] .argus-tab,')
+            html.append('html.theme-light .argus-tab,')
+            html.append('html.light .argus-tab,')
+            html.append('.theme-light .argus-tab,')
+            html.append('.argus-tab[data-mode="light"] {')
+            html.append('--argus-text:#000000;')
+            html.append('--argus-bg-card:rgba(0,0,0,0.03);')
+            html.append('--argus-bg-header:rgba(0,0,0,0.05);')
+            html.append('--argus-bg-pill:rgba(0,0,0,0.06);')
+            html.append('--argus-border:rgba(0,0,0,0.10);')
+            html.append('--argus-border-soft:rgba(0,0,0,0.06);')
+            html.append('--argus-bg-diag:rgba(0,0,0,0.025);')
+            html.append('--argus-btn-border:rgba(0,0,0,0.20);')
+            html.append('}')
+            // Light-mode inline-opacity boosts. Many places use
+            // style="opacity:0.55" for label text (POWER, HEALTH, iLO,
+            // etc.). With pure-black base in light mode the contrast is
+            // OK but the labels still look washed out — boosting opacity
+            // to ~0.8 makes them clearly legible. CSS attribute-substring
+            // selectors target the inline styles and override with
+            // !important — that is the only way to win specificity
+            // against inline style.
+            html.append('.argus-tab[data-mode="light"] [style*="opacity:0.4"]  { opacity:0.70 !important; }')
+            html.append('.argus-tab[data-mode="light"] [style*="opacity:0.45"] { opacity:0.72 !important; }')
+            html.append('.argus-tab[data-mode="light"] [style*="opacity:0.5"]  { opacity:0.78 !important; }')
+            html.append('.argus-tab[data-mode="light"] [style*="opacity:0.55"] { opacity:0.82 !important; }')
+            html.append('.argus-tab[data-mode="light"] [style*="opacity:0.6"]  { opacity:0.85 !important; }')
+            html.append('.argus-tab[data-mode="light"] [style*="opacity:0.65"] { opacity:0.85 !important; }')
+            html.append('.argus-tab[data-mode="light"] [style*="opacity:0.7"]  { opacity:0.88 !important; }')
+            html.append('.argus-tab[data-mode="light"] [style*="opacity:0.75"] { opacity:0.90 !important; }')
+            html.append('.argus-tab[data-mode="light"] [style*="opacity:0.8"]  { opacity:0.92 !important; }')
+            // OS-level light preference as last-resort fallback when both
+            // theme-class and JS data-mode detection miss. Skip if the
+            // tab is explicitly tagged data-mode="dark".
+            html.append('@media (prefers-color-scheme: light) {')
+            html.append('.argus-tab:not([data-mode="dark"]) {')
+            html.append('--argus-text:#000000;')
+            html.append('--argus-bg-card:rgba(0,0,0,0.03);')
+            html.append('--argus-bg-header:rgba(0,0,0,0.05);')
+            html.append('--argus-bg-pill:rgba(0,0,0,0.06);')
+            html.append('--argus-border:rgba(0,0,0,0.10);')
+            html.append('--argus-border-soft:rgba(0,0,0,0.06);')
+            html.append('--argus-bg-diag:rgba(0,0,0,0.025);')
+            html.append('--argus-btn-border:rgba(0,0,0,0.20);')
+            html.append('}')
+            html.append('}')
+            html.append('</style>')
+
+            html.append('<div class="argus-tab" style="padding:0; font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif; color:var(--argus-text); font-size:13px;">')
+
+            // ── v0.1.37 — JS theme detection (runs always) ───────────────
+            //
+            // v0.1.36's CSS-only theme detection missed Morpheus 9's
+            // actual theme class. Rather than guess at more class names,
+            // v0.1.37 reads the body's computed background color at
+            // runtime, computes its luminance, and sets data-mode="light"
+            // or data-mode="dark" on every .argus-tab element. The CSS
+            // rules above then switch reliably regardless of how Morpheus
+            // names its theme.
+            //
+            // Runs OUTSIDE the readonly/launchData gates so it works for
+            // hosts in any state. Defensive try/catch — failure leaves
+            // the dark-mode default.
+            //
+            // Requires the CSP nonce. If the nonce is unavailable (e.g.
+            // appliance running without Spring CSP, or version mismatch),
+            // theme detection silently falls back to CSS-only matching
+            // (which works in Morpheus versions whose theme class
+            // matches our list).
+            String themeNonce = getCspNonce()
+            if (themeNonce) {
+                html.append("<script nonce=\"${escapeHtml(themeNonce)}\">")
+                html.append("""
+(function() {
+  try {
+    // Wait for body to be available, then detect theme from its bg color.
+    var detectTheme = function() {
+      try {
+        var body = document.body;
+        if (!body) return;
+        var bg = window.getComputedStyle(body).backgroundColor;
+        // Parse "rgb(r, g, b)" or "rgba(r, g, b, a)" — Morpheus always
+        // returns one of these for body bg.
+        var m = bg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+        if (!m) return;
+        var r = parseInt(m[1], 10);
+        var g = parseInt(m[2], 10);
+        var bl = parseInt(m[3], 10);
+        // Relative luminance approximation (Rec. 709 coefficients,
+        // good enough for a binary light/dark decision).
+        var lum = (0.299 * r + 0.587 * g + 0.114 * bl) / 255;
+        var mode = lum > 0.5 ? 'light' : 'dark';
+        var tabs = document.getElementsByClassName('argus-tab');
+        for (var i = 0; i < tabs.length; i++) {
+          tabs[i].setAttribute('data-mode', mode);
+        }
+      } catch (e) { /* failure leaves default theme */ }
+    };
+    // Run once now; some renders may have body bg already computed.
+    detectTheme();
+    // Run again after DOM is fully ready in case bg was set by late CSS.
+    if (document.readyState !== 'complete') {
+      window.addEventListener('load', detectTheme);
+    }
+
+    // v0.1.38 — UID indicator LED action wiring.
+    //
+    // Each UID button in the System card carries data-uid="Off|Lit|Blinking".
+    // Clicking navigates the iLO tab to the current URL with
+    // ?argusUidAction=<value> appended (preserving other query params like
+    // tab=iLO). renderTemplate picks the param up via getRequestParam(),
+    // forwards it to RedfishClient.collectStatus, and the System card
+    // re-renders with the new badge state.
+    //
+    // We also strip argusUidAction from the URL on every page load so
+    // that a browser refresh doesn't re-fire the action — important
+    // since the param sticks around in the address bar after the
+    // server-side navigation.
+    var stripArgusUidAction = function() {
+      try {
+        var url = new URL(window.location.href);
+        if (url.searchParams.has('argusUidAction')) {
+          url.searchParams.delete('argusUidAction');
+          window.history.replaceState(null, '', url.toString());
+        }
+      } catch (e) { /* old browser, no URL constructor — just leave it */ }
+    };
+    stripArgusUidAction();
+
+    var wireUidButtons = function() {
+      try {
+        var btns = document.querySelectorAll('.argus-uid-btn');
+        for (var i = 0; i < btns.length; i++) {
+          (function(btn) {
+            btn.addEventListener('click', function(ev) {
+              try {
+                ev.preventDefault();
+                var action = btn.getAttribute('data-uid');
+                if (!action) return;
+                var url = new URL(window.location.href);
+                url.searchParams.set('argusUidAction', action);
+                // Small visual cue so the user knows the click registered
+                // — the page will reload momentarily.
+                btn.style.opacity = '0.5';
+                btn.disabled = true;
+                window.location.href = url.toString();
+              } catch (e) { /* fallback: do nothing, leave click as no-op */ }
+            });
+          })(btns[i]);
+        }
+      } catch (e) { /* querySelectorAll not available — nothing to wire */ }
+    };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', wireUidButtons);
+    } else {
+      wireUidButtons();
+    }
+  } catch (err) {
+    // Theme/UID setup failure is non-fatal — CSS-only matching still
+    // applies via prefers-color-scheme; UID buttons just become no-ops.
+  }
+})();
+""")
+                html.append('</script>')
+                // v0.1.38 — pulse animation for the BLINK badge. Lives in
+                // its own <style> tag so we don't bloat the CSS variables
+                // block. CSP allows inline <style> by default in Morpheus.
+                html.append('<style>@keyframes argusUidPulse { 0%,100%{opacity:1} 50%{opacity:0.25} } .argus-uid-pulse { animation: argusUidPulse 1s ease-in-out infinite; }</style>')
+            }
 
             // Resolve credentials for embedding into the (CSS-toggleable)
             // credentials panel. Same security profile as before: rendered
@@ -145,6 +376,60 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     ]
                 }
             }
+
+            // ── v0.1.36 — Read plugin settings + mint launch token ──────
+            //
+            // Plugin settings control three behaviors:
+            //   - launchMode  : 'auto' (SSO) vs 'link' (no auth, manual login)
+            //   - windowMode  : 'popup' vs 'tab'
+            //   - authMethod  : 'auto' vs 'sessionkey' vs 'cookie' (legacy)
+            //
+            // Defaults preserve v0.1.35 behavior so upgrading without touching
+            // settings is invisible to existing users.
+            //
+            // For the sessionkey URL path we mint an extra Redfish session
+            // here, capture the token, and DELIBERATELY don't log out — the
+            // session is meant to be consumed by the user's click on the
+            // launch link. iLO reaps idle sessions after ~30 min if unused.
+            // This burns one extra session per tab render, which is fine for
+            // a non-polling UI.
+            //
+            // The mint is skipped when:
+            //   - Plugin setting authMethod == 'cookie' (force legacy)
+            //   - Plugin setting launchMode == 'link' (no auth needed)
+            //   - launchData is null (host not configured / cred unresolved)
+            //
+            // If the mint fails (firmware quirk, network blip), launchToken
+            // stays null and we cleanly fall back to the form-POST path. The
+            // setting authMethod == 'sessionkey' (no fallback) is still
+            // tolerated — in that case the launch link will be a /irc.html
+            // link without a session, which lands the user on iLO's login
+            // page; that's the documented behavior for that setting.
+            Map argusSettings = [launchMode:'auto', windowMode:'popup', authMethod:'auto']
+            try { argusSettings = ((IloConsolePlugin) plugin).readArgusSettings() } catch (Throwable t) {
+                log.warn("argus: readArgusSettings failed, using defaults: ${t.message}")
+            }
+            String launchToken = null
+            if (launchData && argusSettings.launchMode != 'link' && argusSettings.authMethod != 'cookie') {
+                try {
+                    launchToken = com.morpheusdata.iloconsole.services.RedfishClient.acquireLaunchToken(
+                            launchData.iloHost as String,
+                            cfg.verifySsl as boolean,
+                            launchData.username as String,
+                            launchData.password as String
+                    )
+                    if (launchToken) {
+                        log.info("argus.launch.method=sessionkey-ready host=${launchData.iloHost}")
+                    } else {
+                        log.info("argus.launch.method=sessionkey-mint-failed host=${launchData.iloHost} fallback=cookie")
+                    }
+                } catch (Throwable t) {
+                    log.warn("argus: launch token mint threw: ${t.message}")
+                }
+            }
+            String resolvedAuthMethod = launchToken ? 'sessionkey' :
+                    (argusSettings.launchMode == 'link' ? 'link-only' :
+                            (argusSettings.authMethod == 'sessionkey' ? 'sessionkey-failed-no-fallback' : 'cookie'))
 
             if (launchData) {
                 String pfx = "iloTab_${server?.id ?: 'x'}"
@@ -208,7 +493,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
   margin:0;
 }
 #${pfx}-root .ilo-btn {
-  background:transparent; border-color:rgba(255,255,255,0.15); color:#dbe6ef;
+  background:transparent; border-color:var(--argus-btn-border); color:var(--argus-text);
   padding:5px 12px; font-size:11px; font-weight:400;
 }
 #${pfx}-root .ilo-btn:hover { border-color:#01A982; color:#fff; }
@@ -225,7 +510,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
 #${pfx}-root #${pfx}-pass-toggle:checked ~ .ilo-cred-panel .ilo-pass-mask { display:none; }
 #${pfx}-root #${pfx}-pass-toggle:checked ~ .ilo-cred-panel .ilo-pass-real { display:inline; }
 #${pfx}-root .ilo-copyable {
-  background:rgba(255,255,255,0.06); padding:2px 8px; border-radius:3px;
+  background:var(--argus-border); padding:2px 8px; border-radius:3px;
   font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
   cursor:text; user-select:all; -webkit-user-select:all;
 }
@@ -254,30 +539,87 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 // Header row with title + (when not readonly) launch buttons +
                 // Show-credentials toggle. Readonly mode shows just the title
                 // and a small yellow "Read-only" pill.
-                html.append('<div style="display:flex; align-items:center; gap:12px; padding:12px 16px; background:rgba(255,255,255,0.03); border-radius:4px; margin-bottom:14px; flex-wrap:wrap;">')
-                html.append('<h2 style="margin:0; font-size:15px; font-weight:600; flex:1; min-width:140px; text-transform:none;">iLO</h2>')
+                html.append('<div style="display:flex; align-items:center; gap:12px; padding:12px 16px; background:var(--argus-bg-header); border-radius:4px; margin-bottom:14px; flex-wrap:wrap;">')
+                html.append('<h2 style="margin:0; font-size:15px; font-weight:600; flex:1; min-width:140px; text-transform:none; display:flex; align-items:center; gap:8px;">')
+                html.append('<span>iLO</span>')
+                // v0.1.36 — small external-link to the iLO root UI, next to
+                // the "iLO" header. Opens iLO's own login page in a new tab.
+                // Useful when users want to administer iLO settings outside
+                // the Morpheus tab (firmware updates, user management, etc).
+                // No auth handoff — the user types creds at iLO's prompt.
+                String iloRootHref = "https://${escapeHtml(launchData.iloHost as String)}/"
+                html.append("<a href=\"${iloRootHref}\" target=\"_blank\" rel=\"noopener noreferrer\" " +
+                        "title=\"Open the iLO management UI in a new tab. iLO login required.\" " +
+                        "style=\"display:inline-flex; align-items:center; gap:4px; font-size:11px; " +
+                        "font-weight:400; color:var(--argus-text); opacity:0.65; text-decoration:none;\">")
+                // Inline SVG external-link icon — no asset dependency.
+                html.append('<svg width="12" height="12" viewBox="0 0 24 24" fill="none" ')
+                html.append('stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">')
+                html.append('<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>')
+                html.append('<polyline points="15 3 21 3 21 9"/>')
+                html.append('<line x1="10" y1="14" x2="21" y2="3"/>')
+                html.append('</svg>')
+                html.append('<span>Open iLO UI</span>')
+                html.append('</a>')
+                html.append('</h2>')
                 if (cfg.readonly) {
                     html.append('<span class="ilo-ro-pill">Read-only</span>')
                 } else {
-                    // v0.1.24 launch UI: text/plain form-POST + companion link.
+                    // ── v0.1.36 — Layered launch ───────────────────────
                     //
-                    // The form has ONE crafted hidden input. enctype="text/plain"
-                    // writes `<name>=<value>` for each field, no URL encoding.
-                    // Our name+value concatenation yields valid JSON that iLO's
-                    // /json/login_session parser accepts (see comment block
-                    // above where injectName/injectValue are constructed).
+                    // Three possible button strategies based on plugin
+                    // settings + token-mint success:
                     //
-                    // v0.1.30: each button has a `title` attribute that the
-                    // browser surfaces as a native hover tooltip — quick
-                    // explanation of what the button does, without needing the
-                    // user to read the README first.
+                    //   1. sessionkey URL (preferred): single <a href=
+                    //      "https://<host>/irc.html?sessionkey=<TOKEN>">
+                    //      One click, no form, no cookie race. Used when
+                    //      launchToken is non-null (mint succeeded).
+                    //
+                    //   2. link-only: simple <a> to /irc.html, no auth.
+                    //      User types creds at iLO login. Used when
+                    //      plugin setting launchMode == 'link'.
+                    //
+                    //   3. cookie POST (legacy): the v0.1.35 text/plain
+                    //      JSON-injection form-POST + setTimeout JS dance.
+                    //      Used when sessionkey mint failed in auto mode,
+                    //      OR when authMethod == 'cookie' is forced.
+                    //
+                    // The "Open Console" companion link always renders —
+                    // it lets the user re-open an already-authenticated
+                    // session in the same window.
                     String tgt = "iloConsole_${server?.id}"
                     html.append("<label for=\"${pfx}-cred-toggle\" class=\"ilo-btn\" title=\"Reveals the configured iLO username and password for manual copy/paste. Pure HTML/CSS \u2014 nothing transmitted.\">Show credentials</label>")
-                    html.append("<form class=\"ilo-launch-form\" method=\"POST\" enctype=\"text/plain\" action=\"${escapeHtml(iloLoginUrl)}\" target=\"${tgt}\" autocomplete=\"off\">")
-                    html.append("<input type=\"hidden\" name=\"${escapeHtml(injectName)}\" value=\"${escapeHtml(injectValue)}\">")
-                    html.append('<button type="submit" class="ilo-btn-primary" title="Auto-logs into iLO with the stored credentials, then opens the IRC console pre-authenticated. One click does both steps.">&#9658; Launch Console</button>')
-                    html.append('</form>')
-                    html.append("<a class=\"ilo-btn-primary\" href=\"${escapeHtml(iloIrcUrl)}\" target=\"${tgt}\" rel=\"noopener\" title=\"Opens the IRC console using the existing iLO session cookie set by Launch Console. Use after the popup has authenticated, or to re-open the console in the same window.\">&#10142; Open Console</a>")
+
+                    if (launchToken) {
+                        // Strategy 1: sessionkey URL — single deterministic
+                        // link. iLO accepts the token via URL parameter and
+                        // logs the user in without any cookie commit race.
+                        String iloIrcWithKey = "https://${escapeHtml(launchData.iloHost as String)}/irc.html?sessionkey=${escapeHtml(launchToken)}"
+                        html.append("<a class=\"ilo-btn-primary\" data-argus-launch=\"1\" href=\"${iloIrcWithKey}\" target=\"${tgt}\" rel=\"noopener\" " +
+                                "title=\"One-click pre-authenticated console launch (v0.1.36 sessionkey URL).\">" +
+                                "&#9658; Launch Console</a>")
+                    } else if (argusSettings.launchMode == 'link') {
+                        // Strategy 2: link-only mode. No auth attempted.
+                        // User logs into iLO with their own credentials at
+                        // the prompt — iLO logs the real user identity.
+                        String iloIrcOnly = "https://${escapeHtml(launchData.iloHost as String)}/irc.html"
+                        html.append("<a class=\"ilo-btn-primary\" data-argus-launch=\"1\" href=\"${iloIrcOnly}\" target=\"${tgt}\" rel=\"noopener\" " +
+                                "title=\"Opens the iLO console. iLO login required (Link-only mode).\">" +
+                                "&#9658; Launch Console</a>")
+                    } else {
+                        // Strategy 3: legacy form-POST. This is exactly the
+                        // v0.1.35 flow — the JSON-injection trick that posts
+                        // credentials to /json/login_session, with a CSP-
+                        // nonced inline script for the one-click experience.
+                        // Reached when sessionkey mint failed (and we're in
+                        // auto mode), or when authMethod=='cookie' forces it.
+                        html.append("<form class=\"ilo-launch-form\" method=\"POST\" enctype=\"text/plain\" action=\"${escapeHtml(iloLoginUrl)}\" target=\"${tgt}\" autocomplete=\"off\">")
+                        html.append("<input type=\"hidden\" name=\"${escapeHtml(injectName)}\" value=\"${escapeHtml(injectValue)}\">")
+                        html.append('<button type="submit" class="ilo-btn-primary" title="Auto-logs into iLO with the stored credentials, then opens the IRC console pre-authenticated. One click does both steps.">&#9658; Launch Console</button>')
+                        html.append('</form>')
+                    }
+
+                    html.append("<a class=\"ilo-btn-primary\" data-argus-launch=\"1\" href=\"${escapeHtml(iloIrcUrl)}\" target=\"${tgt}\" rel=\"noopener\" title=\"Opens the IRC console using the existing iLO session cookie set by Launch Console. Use after the popup has authenticated, or to re-open the console in the same window.\">&#10142; Open Console</a>")
                 }
 
                 html.append('</div>') // end header row
@@ -306,17 +648,98 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     String jsIrcUrl = jsonStringEscape(iloIrcUrl)
                     String jsTarget = jsonStringEscape(tgt)
                     String rootId   = "${pfx}-root"
+                    // v0.1.36 — windowMode controls window.open features.
+                    // 'popup' adds size hints (1280x800). 'tab' uses an EMPTY
+                    // features string so the browser opens a normal tab.
+                    //
+                    // v0.1.39 fix — prior versions passed 'noopener' as the
+                    // tab-mode features string. A non-empty features arg to
+                    // window.open forces popup-window behavior in Chrome,
+                    // Edge, and Firefox regardless of which keywords are
+                    // present — 'noopener' is a security flag, not a tab-vs-
+                    // window control. Pass an empty string instead. The
+                    // `rel="noopener"` already on every <a> tag still gives
+                    // us the opener-isolation we wanted from that keyword.
+                    String windowFeatures = (argusSettings.windowMode == 'tab')
+                            ? ''
+                            : 'width=1280,height=800,resizable=yes,scrollbars=no,location=yes,toolbar=no'
+                    String jsWindowFeatures = jsonStringEscape(windowFeatures)
+                    String jsWindowMode     = jsonStringEscape(argusSettings.windowMode as String ?: 'popup')
                     html.append("<script nonce=\"${escapeHtml(nonce)}\">")
                     html.append("""
 (function() {
   try {
     var root = document.getElementById("${jsonStringEscape(rootId)}");
     if (!root) return;
+    var ircUrl = "${jsIrcUrl}";
+    var target = "${jsTarget}";
+    var windowFeatures = "${jsWindowFeatures}";
+    var windowMode = "${jsWindowMode}";
+
+    // ── v0.1.39 — choose target by windowMode ──────────────────────────
+    //
+    // For popup mode: keep the named target so repeated clicks reuse the
+    // same popup window (matches the v0.1.36 behavior).
+    //
+    // For tab mode: switch to '_blank' for link-flow clicks and to a
+    // unique-per-click name for the form-POST flow. Why this matters:
+    //   1. A non-empty features string forces popup behavior, so we set
+    //      features='' in tab mode (done server-side above).
+    //   2. But a NAMED target also reuses any existing window with that
+    //      name. If the user opened a popup earlier and then switched to
+    //      tab mode, every subsequent click would land back in the old
+    //      popup. Using '_blank' (link) or a unique name (form) avoids
+    //      that reuse and forces a brand-new tab each time.
+    //   3. The form-POST flow can't use '_blank' because we need a name
+    //      to pin both the pre-opened window and the form.target to the
+    //      same browsing context. A timestamped name gives us a fresh
+    //      tab AND a window reference for the setTimeout follow-up.
+    var linkTarget = (windowMode === 'tab') ? '_blank' : target;
+
+    // ── v0.1.36 — intercept sessionkey / link-only Launch Console <a> ──
+    //
+    // The sessionkey URL and link-only paths render a plain <a href> link.
+    // The browser's default handler ignores window.open features, so a
+    // user who selected windowMode=popup would still get a tab. We
+    // intercept those clicks and re-open via window.open with the
+    // configured features.
+    //
+    // Marked with data-argus-launch="1" so we don't accidentally hook
+    // unrelated links. preventDefault stops the browser's default tab.
+    //
+    // v0.1.39 — Open Console gained data-argus-launch="1" too, so the
+    // selector picks up both Launch and Open Console buttons.
+    var launchLinks = root.querySelectorAll('a[data-argus-launch="1"]');
+    for (var i = 0; i < launchLinks.length; i++) {
+      (function(link) {
+        link.addEventListener('click', function(ev) {
+          var href = link.getAttribute('href');
+          if (!href) return;
+          try {
+            var win = window.open(href, linkTarget, windowFeatures);
+            if (win) {
+              ev.preventDefault();
+              try { win.focus(); } catch (e) { /* ignore */ }
+            }
+            // If popup blocked (win == null), don't preventDefault — let
+            // the browser navigate the user's existing tab/window normally
+            // so they at least land on iLO.
+          } catch (e) {
+            // window.open threw — let the default <a> behavior run.
+          }
+        });
+      })(launchLinks[i]);
+    }
+
+    // ── v0.1.35 legacy — form-POST one-click flow ──────────────────────
+    //
+    // Only runs when the legacy form-POST launch strategy is in play
+    // (sessionkey mint failed in auto mode, OR authMethod=='cookie').
+    // If neither form nor button exists (sessionkey/link-only paths),
+    // gracefully exits via the if-check below.
     var form = root.querySelector('form.ilo-launch-form');
     var btn  = form ? form.querySelector('button[type="submit"]') : null;
     if (!form || !btn) return;
-    var ircUrl = "${jsIrcUrl}";
-    var target = "${jsTarget}";
     var delayMs = 1500;
     var navigated = false;
 
@@ -326,8 +749,23 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
       // empty URL and an existing name returns a reference to the
       // existing window without navigating it — the form's default
       // submission that follows will then navigate it to the iLO POST.
+      // v0.1.36 — also apply windowFeatures here so popup/tab mode is
+      // honored on legacy launch path.
+      //
+      // v0.1.39 — in tab mode, generate a fresh unique target name per
+      // click and pin both the form.target AND the pre-opened window to
+      // it. This bypasses popup-window reuse from earlier clicks while
+      // preserving the JS window reference we need for the iLO->IRC
+      // navigation follow-up.
+      var formTarget;
+      if (windowMode === 'tab') {
+        formTarget = target + '_' + Date.now();
+        try { form.target = formTarget; } catch (e) { /* ignore */ }
+      } else {
+        formTarget = target;
+      }
       var win;
-      try { win = window.open('', target); } catch (e) { win = null; }
+      try { win = window.open('about:blank', formTarget, windowFeatures); } catch (e) { win = null; }
       if (!win) return;
       // Schedule the follow-up navigation to IRC. We can set
       // win.location.href cross-origin from the opener, even after the
@@ -353,7 +791,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 // is set, the credentials never appear in the DOM, so a
                 // dev-tools peek shows nothing sensitive.
                 if (!cfg.readonly) {
-                    html.append('<div class="ilo-cred-panel" style="background:rgba(255,255,255,0.02); border:1px solid rgba(1,169,130,0.3); border-radius:4px; padding:12px 16px; margin-bottom:14px; font-size:12px;">')
+                    html.append('<div class="ilo-cred-panel" style="background:var(--argus-bg-card); border:1px solid rgba(1,169,130,0.3); border-radius:4px; padding:12px 16px; margin-bottom:14px; font-size:12px;">')
 
                     html.append('<div style="margin-bottom:10px; opacity:0.7; font-size:11px;">Two-step launch: click <strong>Launch Console</strong> (the popup briefly shows iLO\'s session response — that\'s expected), then <strong>Open Console</strong> to load the IRC interface. If the popup gets stuck at iLO\'s login screen, paste these by hand. Single-click a value to select it, then Ctrl+C (Cmd+C on Mac) to copy.</div>')
 
@@ -391,7 +829,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 // users see "iLO" and know where they are. The detailed
                 // error/configure-access cards below the header explain
                 // what went wrong.
-                html.append('<div style="display:flex; align-items:center; gap:12px; padding:12px 16px; background:rgba(255,255,255,0.03); border-radius:4px; margin-bottom:14px; flex-wrap:wrap;">')
+                html.append('<div style="display:flex; align-items:center; gap:12px; padding:12px 16px; background:var(--argus-bg-header); border-radius:4px; margin-bottom:14px; flex-wrap:wrap;">')
                 html.append('<h2 style="margin:0; font-size:15px; font-weight:600; flex:1; min-width:140px; text-transform:none;">iLO</h2>')
                 if (cfg.configured && cfg.iloHost) {
                     // We have an iLO host but couldn't pull status — still
@@ -403,7 +841,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
             }
 
             // Detected hardware
-            html.append('<div style="background:rgba(255,255,255,0.02); padding:10px 14px; border-radius:4px; margin-bottom:14px; font-size:12px;">')
+            html.append('<div style="background:var(--argus-bg-card); padding:10px 14px; border-radius:4px; margin-bottom:14px; font-size:12px;">')
             if (hw.vendor) {
                 html.append("<strong>Detected:</strong> ${escapeHtml(hw.vendor as String)}")
                 if (hw.model) html.append(" &middot; ${escapeHtml(hw.model as String)}")
@@ -447,7 +885,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
             // (say) thermal data just doesn't get a Power & Cooling card.
             if (status?.success) {
                 // ── System card ──
-                html.append('<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
+                html.append('<div style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
                 html.append('<h3 style="margin:0 0 12px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;">System</h3>')
                 html.append('<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px 24px;">')
                 html.append(statusItem('Power', status.powerState as String, status.powerClass as String))
@@ -459,14 +897,66 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 if (status.serial)      html.append(kvItem('Serial',     status.serial as String))
                 if (status.assetTag)    html.append(kvItem('Asset Tag',  status.assetTag as String))
                 if (status.chassisSku)  html.append(kvItem('SKU',        status.chassisSku as String))
-                if (status.indicatorLed) {
-                    String led = status.indicatorLed as String
-                    // v0.1.31: match what's physically on the server's front panel.
-                    // HPE UID LED is BLUE when lit/blinking, dark when off.
-                    // Off = default grey pill (no light). Lit/Blinking = blue pill.
-                    String ledClass = (led == 'Lit' || led == 'Blinking') ? 'info' : null
-                    html.append(statusItem('Indicator LED', led, ledClass))
+                // v0.1.38 — UID (Unit Identification) LED cell.
+                //
+                // Always renders, even when the read returned null (we
+                // show "Unknown" in that case). The cell contains:
+                //   - the current state as a colored badge
+                //   - three action buttons: Off / Lit / Blink
+                //
+                // Button clicks navigate the iLO tab to ?argusUidAction=<value>,
+                // which the renderTemplate dispatch path picks up via
+                // getRequestParam() and forwards to RedfishClient.collectStatus.
+                // collectStatus then PATCHes /Systems/1 (falling back to
+                // /Chassis/1) BEFORE the bulk-read, so the System card
+                // badge reflects the new state on the same render.
+                //
+                // Color semantics match the physical front panel:
+                //   - Off:      neutral grey badge (no light)
+                //   - Lit:      solid blue badge with steady dot
+                //   - Blinking: blue badge with a pulsing dot (CSS animation)
+                //   - Unknown:  grey badge with em-dash
+                //
+                // The button corresponding to the current state is styled
+                // as disabled-but-still-clickable. Re-sending the current
+                // state is a no-op (iLO accepts the PATCH and returns 200)
+                // so we don't bother suppressing the click — it's idempotent.
+                String led = (status.indicatorLed as String) ?: 'Unknown'
+                String ledBadge
+                if (led == 'Lit') {
+                    ledBadge = '<span style="display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:11px; background:#1e6fb8; color:#fff; font-size:11px; font-weight:600;"><span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:#9fd5ff;"></span>LIT</span>'
+                } else if (led == 'Blinking') {
+                    ledBadge = '<span style="display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:11px; background:#1e6fb8; color:#fff; font-size:11px; font-weight:600;"><span class="argus-uid-pulse" style="display:inline-block; width:7px; height:7px; border-radius:50%; background:#9fd5ff;"></span>BLINK</span>'
+                } else if (led == 'Off') {
+                    ledBadge = '<span style="display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:11px; background:rgba(127,127,127,0.18); color:inherit; font-size:11px; font-weight:600;"><span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:rgba(127,127,127,0.55);"></span>OFF</span>'
+                } else {
+                    ledBadge = '<span style="display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:11px; background:rgba(127,127,127,0.18); color:inherit; font-size:11px; font-weight:600;">&mdash;</span>'
                 }
+                String btnBase = 'border:1px solid var(--argus-border); background:transparent; color:inherit; padding:2px 8px; border-radius:3px; font-size:11px; cursor:pointer; line-height:1.4;'
+                String btnActive = 'border:1px solid var(--argus-border); background:rgba(127,127,127,0.18); color:inherit; padding:2px 8px; border-radius:3px; font-size:11px; cursor:pointer; line-height:1.4; opacity:0.8;'
+                String offStyle  = (led == 'Off')      ? btnActive : btnBase
+                String litStyle  = (led == 'Lit')      ? btnActive : btnBase
+                String blnkStyle = (led == 'Blinking') ? btnActive : btnBase
+                html.append('<div>')
+                html.append('<div style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.55; margin-bottom:4px;">UID</div>')
+                html.append('<div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">')
+                html.append(ledBadge)
+                html.append('<button type="button" class="argus-uid-btn" data-uid="Off"      style="' + offStyle  + '">Off</button>')
+                html.append('<button type="button" class="argus-uid-btn" data-uid="Lit"      style="' + litStyle  + '">Lit</button>')
+                html.append('<button type="button" class="argus-uid-btn" data-uid="Blinking" style="' + blnkStyle + '">Blink</button>')
+                html.append('</div>')
+                // Surface a tiny inline status line right under the buttons
+                // when the user just performed an action — green check on
+                // success, red error message on failure. The line vanishes
+                // on the next render (no param → no status).
+                if (status.uidActionRequested) {
+                    if (status.uidActionSuccess) {
+                        html.append('<div style="font-size:10px; opacity:0.65; margin-top:4px;">&#10003; UID set to ' + escapeHtml(status.uidActionRequested as String) + '</div>')
+                    } else {
+                        html.append('<div style="font-size:10px; color:#c0392b; margin-top:4px;">&#9888; UID change failed: ' + escapeHtml((status.uidActionError as String) ?: 'unknown error') + '</div>')
+                    }
+                }
+                html.append('</div>')
                 // v0.1.29 additions to System card
                 if (status.tpmModuleType) {
                     String tpmText = status.tpmModuleType as String
@@ -505,7 +995,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 boolean hasPower = (status.powerConsumedWatts != null) || (status.psuCount as Integer ?: 0) > 0
                 boolean hasThermal = !((status.temperatures ?: []).isEmpty() && (status.fans ?: []).isEmpty())
                 if (hasPower || hasThermal) {
-                    html.append('<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
+                    html.append('<div style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
                     html.append('<h3 style="margin:0 0 12px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;">Power &amp; Cooling</h3>')
                     html.append('<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px 24px;">')
 
@@ -613,7 +1103,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 boolean ptHaveHist = ptHist.size() >= 2
                 boolean ptrendHasAny = ptHaveCurrent || ptHaveMin || ptHaveAvg || ptHaveMax || ptHaveHist
                 if (ptrendHasAny) {
-                    html.append('<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
+                    html.append('<div style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
                     html.append('<h3 style="margin:0 0 12px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;">Power Trend</h3>')
                     html.append('<div style="display:flex; align-items:center; gap:20px; flex-wrap:wrap;">')
 
@@ -621,7 +1111,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     if (ptHaveHist) {
                         html.append(renderPowerSparkline(ptHist))
                     } else {
-                        html.append('<div style="flex:1; min-width:240px; padding:18px 12px; background:rgba(255,255,255,0.02); border-radius:3px; font-size:11px; opacity:0.55; text-align:center; line-height:1.5;">')
+                        html.append('<div style="flex:1; min-width:240px; padding:18px 12px; background:var(--argus-bg-card); border-radius:3px; font-size:11px; opacity:0.55; text-align:center; line-height:1.5;">')
                         html.append('No history available<br><span style="font-size:10px;">iLO didn\'t return /Power/PowerMeter samples on this hardware tier</span>')
                         html.append('</div>')
                     }
@@ -659,7 +1149,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 boolean hasHostNet = status.hostMac || status.hostIp
                 boolean hasIloNet  = status.iloMac  || status.iloIp || status.iloHostName
                 if (hasHostNet || hasIloNet) {
-                    html.append('<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
+                    html.append('<div style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
                     html.append('<h3 style="margin:0 0 12px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;">Network</h3>')
                     html.append('<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px 24px;">')
                     if (status.hostMac) html.append(kvItem('Host MAC', status.hostMac as String))
@@ -694,11 +1184,11 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 List netAdapters = (status.networkAdapters ?: []) as List
                 if (netAdapters) {
                     Integer totalPorts = (netAdapters.sum { ((it.ports ?: []) as List).size() } ?: 0) as Integer
-                    html.append('<details style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
+                    html.append('<details style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
                     html.append("<summary style=\"cursor:pointer; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;\">Network Adapters &mdash; ${netAdapters.size()} adapter${netAdapters.size() == 1 ? '' : 's'}, ${totalPorts} port${totalPorts == 1 ? '' : 's'}</summary>")
                     netAdapters.eachWithIndex { Map a, int idx ->
                         String topPad = (idx == 0) ? '4px' : '12px'
-                        String borderTop = (idx == 0) ? '' : 'border-top:1px solid rgba(255,255,255,0.04); '
+                        String borderTop = (idx == 0) ? '' : 'border-top:1px solid var(--argus-border-soft); '
                         html.append("<div style=\"margin-top:12px; padding-top:${topPad}; ${borderTop}\">")
                         // Adapter identity header (inline kv)
                         html.append('<div style="display:flex; flex-wrap:wrap; gap:6px 16px; align-items:baseline; margin-bottom:8px;">')
@@ -736,7 +1226,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                                 String lColor = (link == 'LinkUp') ? '#28a745' : ((link == 'LinkDown' || link == 'NoLink') ? '#7a8a98' : '#ffc107')
                                 String speedStr = port.speedMbps ? "${port.speedMbps} Mbps" : '\u2014'
                                 String macStr = ((port.macs ?: []) as List).join(', ')
-                                html.append('<tr style="border-top:1px solid rgba(255,255,255,0.04);">')
+                                html.append('<tr style="border-top:1px solid var(--argus-border-soft);">')
                                 html.append("<td style=\"padding:6px 12px 6px 0; font-family:ui-monospace,monospace;\">${escapeHtml((port.portNumber ?: port.name ?: port.id ?: '\u2014') as String)}</td>")
                                 html.append("<td style=\"padding:6px 12px 6px 0; color:${lColor}; font-weight:600;\">${escapeHtml(link)}</td>")
                                 html.append("<td style=\"padding:6px 12px 6px 0; text-align:right; font-family:ui-monospace,monospace;\">${escapeHtml(speedStr)}</td>")
@@ -750,36 +1240,67 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     html.append('</details>')
                 }
 
-                // ── NIC Port LEDs (v0.1.34) ──
-                // At-a-glance per-port health view using HPE Oem.Hpe.PortHealth
-                // plus base Status.Health and LinkStatus. Each port becomes
-                // a colored dot so a problem is visible without expanding
-                // the Network Adapters details above. Kept separate (not
-                // folded into Network Adapters) at user's request — useful
-                // for quick "any red lights?" scans during incident triage.
+                // ── v0.1.36 — Adapter Port LEDs (NIC + HBA split) ──
+                //
+                // What was a single "NIC Port LEDs" card in v0.1.35 is now
+                // split into two cards: "Network Adapter Ports" (Ethernet)
+                // and "Host Bus Adapter Ports" (FC / SAS / InfiniBand).
+                // Motivation: hosts with FC/SAS HBAs were rendering those
+                // ports under the NIC card as confusing dark "—" entries,
+                // since HBA ports have no Mbps link rate and Ethernet-only
+                // status assumptions don't apply.
+                //
+                // Classification key:
+                //   port.activeTech == 'Ethernet'       → NIC bucket
+                //   port.activeTech in [FibreChannel,
+                //                       InfiniBand]     → HBA bucket
+                //   no activeTech but adapter model     → HBA bucket if
+                //     contains FC/HBA/SAS/Fibre markers   model string
+                //                                         matches; else NIC
+                //
+                // HBA ports also display WWPN as monospace subtext (when
+                // present) — SAN admins need it for zoning. NIC ports keep
+                // Mbps semantics. Status colors (Critical/Warning) are
+                // identical across both buckets so a quick scan still
+                // surfaces any red lights.
                 List portLedAdapters = (status.networkAdapters ?: []) as List
-                List allLedPorts = []
+                List<Map> nicLedPorts = []
+                List<Map> hbaLedPorts = []
                 portLedAdapters.each { Map a ->
+                    String adapterModel = ((a.model ?: '') as String).toLowerCase()
+                    boolean adapterLooksLikeHba = adapterModel =~ /\b(fc|hba|sas|fibre|fibrechannel|tri-mode|smart array)\b/
                     ((a.ports ?: []) as List).each { Map port ->
-                        allLedPorts << [adapter: a, port: port]
+                        String tech = ((port.activeTech ?: '') as String)
+                        boolean isHba
+                        if (tech == 'Ethernet') {
+                            isHba = false
+                        } else if (tech == 'FibreChannel' || tech == 'InfiniBand') {
+                            isHba = true
+                        } else {
+                            // No activeTech reported (common on SAS HBAs);
+                            // fall back to the adapter model heuristic. The
+                            // bucket-of-last-resort is NIC so unknown ports
+                            // surface in a more familiar card.
+                            isHba = adapterLooksLikeHba
+                        }
+                        if (isHba) {
+                            hbaLedPorts << [adapter: a, port: port]
+                        } else {
+                            nicLedPorts << [adapter: a, port: port]
+                        }
                     }
                 }
-                if (allLedPorts) {
-                    html.append('<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
-                    html.append('<h3 style="margin:0 0 12px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;">NIC Port LEDs</h3>')
+                // Render the NIC card if any Ethernet ports exist.
+                if (nicLedPorts) {
+                    html.append('<div style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
+                    html.append('<h3 style="margin:0 0 12px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;">Network Adapter Ports</h3>')
                     html.append('<div style="display:flex; flex-wrap:wrap; gap:14px 18px;">')
-                    allLedPorts.each { Map entry ->
+                    nicLedPorts.each { Map entry ->
                         Map a = entry.adapter as Map
                         Map port = entry.port as Map
                         String link = (port.linkStatus as String) ?: ''
                         String hpeHealth = (port.hpePortHealth as String) ?: ''
                         String baseHealth = (port.health as String) ?: ''
-                        // Determination order (most-specific wins):
-                        //   1. HPE OEM critical / base critical → red
-                        //   2. HPE OEM warning / base warning   → yellow
-                        //   3. LinkUp                            → green
-                        //   4. LinkDown / NoLink                 → gray (dim)
-                        //   5. unknown                           → gray
                         String dotColor = '#7a8a98'
                         String label
                         if (hpeHealth == 'Critical' || baseHealth == 'Critical') {
@@ -799,7 +1320,6 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                             label = '\u2014'
                         }
                         String portLabel = (port.portNumber ?: port.name ?: port.id ?: '?') as String
-                        // Native browser tooltip — no JS needed for hover info.
                         String tip = "${a.name ?: a.id}: Port ${portLabel} \u2014 ${label}"
                         if (port.macs) tip += " (${((port.macs ?: []) as List).join(', ')})"
                         html.append("<div style=\"display:flex; align-items:center; gap:8px;\" title=\"${escapeHtml(tip)}\">")
@@ -820,12 +1340,73 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     html.append('</div>')
                     html.append('</div>')
                 }
+                // Render the HBA card only if HBA ports exist — hosts with
+                // no HBAs (the common case for MicroServer / hyperconverged
+                // nodes) just don't see this card.
+                if (hbaLedPorts) {
+                    html.append('<div style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
+                    html.append('<h3 style="margin:0 0 12px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;">Host Bus Adapter Ports</h3>')
+                    html.append('<div style="display:flex; flex-wrap:wrap; gap:14px 18px;">')
+                    hbaLedPorts.each { Map entry ->
+                        Map a = entry.adapter as Map
+                        Map port = entry.port as Map
+                        String link = (port.linkStatus as String) ?: ''
+                        String hpeHealth = (port.hpePortHealth as String) ?: ''
+                        String baseHealth = (port.health as String) ?: ''
+                        // HBA semantic differences from NIC:
+                        //   - "Online/Offline" instead of "Link Up/Down"
+                        //   - Speed shown in Mbps when present (FC links
+                        //     report speed similarly to NICs — 8/16/32 Gbps)
+                        //   - WWPN shown as monospace subtext when present
+                        String dotColor = '#7a8a98'
+                        String label
+                        if (hpeHealth == 'Critical' || baseHealth == 'Critical') {
+                            dotColor = '#d9534f'; label = 'Critical'
+                        } else if (hpeHealth == 'Warning' || baseHealth == 'Warning') {
+                            dotColor = '#ffc107'; label = 'Warning'
+                        } else if (link == 'LinkUp') {
+                            dotColor = '#28a745'
+                            label = 'Online'
+                            if (port.speedMbps) label += " \u00b7 ${port.speedMbps} Mbps"
+                        } else if (link == 'LinkDown' || link == 'NoLink') {
+                            dotColor = '#5a6a78'
+                            label = 'Offline'
+                        } else if (link) {
+                            label = link
+                        } else {
+                            label = '\u2014'
+                        }
+                        String portLabel = (port.portNumber ?: port.name ?: port.id ?: '?') as String
+                        String wwpn = (port.wwpn as String)
+                        String tip = "${a.name ?: a.id}: Port ${portLabel} \u2014 ${label}"
+                        if (wwpn) tip += " (WWPN ${wwpn})"
+                        html.append("<div style=\"display:flex; align-items:center; gap:8px;\" title=\"${escapeHtml(tip)}\">")
+                        html.append("<span style=\"display:inline-block; width:10px; height:10px; border-radius:50%; background:${dotColor}; box-shadow:0 0 6px ${dotColor}55; flex-shrink:0;\"></span>")
+                        html.append('<div style="font-size:11px; line-height:1.3;">')
+                        html.append("<div><strong>Port ${escapeHtml(portLabel)}</strong></div>")
+                        html.append("<div style=\"opacity:0.65;\">${escapeHtml(label)}</div>")
+                        if (wwpn) {
+                            html.append("<div style=\"opacity:0.55; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10px; margin-top:2px;\">WWPN ${escapeHtml(wwpn)}</div>")
+                        }
+                        html.append('</div>')
+                        html.append('</div>')
+                    }
+                    html.append('</div>') // end ports row
+                    // Legend (same color semantics as NIC card)
+                    html.append('<div style="margin-top:12px; display:flex; flex-wrap:wrap; gap:16px; font-size:10px; opacity:0.55;">')
+                    html.append('<span><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#28a745; vertical-align:middle; margin-right:5px;"></span>Online</span>')
+                    html.append('<span><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#5a6a78; vertical-align:middle; margin-right:5px;"></span>Offline</span>')
+                    html.append('<span><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ffc107; vertical-align:middle; margin-right:5px;"></span>Warning</span>')
+                    html.append('<span><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#d9534f; vertical-align:middle; margin-right:5px;"></span>Critical</span>')
+                    html.append('</div>')
+                    html.append('</div>')
+                }
 
                 // ── DIMMs (v0.1.29) ──
                 def dimms = (status.dimms ?: []) as List
                 if (dimms) {
                     Integer totalGiB = dimms.sum { (it.capacityGiB as Integer) ?: 0 } as Integer
-                    html.append('<details style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
+                    html.append('<details style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
                     html.append("<summary style=\"cursor:pointer; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;\">DIMMs &mdash; ${dimms.size()} populated, ${totalGiB} GiB total</summary>")
                     html.append('<table style="width:100%; margin-top:10px; font-size:12px; border-collapse:collapse;">')
                     html.append('<thead><tr style="opacity:0.55; font-size:10px; text-transform:uppercase; letter-spacing:0.05em;">')
@@ -837,7 +1418,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     html.append('<th style="text-align:left; padding:0 0 6px 0;">Part Number</th>')
                     html.append('</tr></thead><tbody>')
                     dimms.each { d ->
-                        html.append('<tr style="border-top:1px solid rgba(255,255,255,0.04);">')
+                        html.append('<tr style="border-top:1px solid var(--argus-border-soft);">')
                         html.append("<td style=\"padding:6px 12px 6px 0; font-family:ui-monospace,monospace;\">${escapeHtml((d.slot ?: '\u2014') as String)}</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; text-align:right; font-family:ui-monospace,monospace;\">${d.capacityGiB ?: '\u2014'} GiB</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; text-align:right; font-family:ui-monospace,monospace; opacity:0.8;\">${d.speedMHz ?: '\u2014'} MHz</td>")
@@ -853,7 +1434,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 // Useful for "is the console already open?" before launching IRC.
                 def activeSessions = (status.activeSessions ?: []) as List
                 if (activeSessions) {
-                    html.append('<details style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
+                    html.append('<details style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
                     html.append("<summary style=\"cursor:pointer; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;\">Active iLO Sessions &mdash; ${activeSessions.size()} other ${activeSessions.size() == 1 ? 'user' : 'users'}</summary>")
                     html.append('<table style="width:100%; margin-top:10px; font-size:12px; border-collapse:collapse;">')
                     html.append('<thead><tr style="opacity:0.55; font-size:10px; text-transform:uppercase; letter-spacing:0.05em;">')
@@ -862,7 +1443,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     html.append('<th style="text-align:left; padding:0 0 6px 0;">Session</th>')
                     html.append('</tr></thead><tbody>')
                     activeSessions.each { s ->
-                        html.append('<tr style="border-top:1px solid rgba(255,255,255,0.04);">')
+                        html.append('<tr style="border-top:1px solid var(--argus-border-soft);">')
                         html.append("<td style=\"padding:6px 12px 6px 0;\">${escapeHtml((s.userName ?: '\u2014') as String)}</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; font-family:ui-monospace,monospace;\">${escapeHtml((s.sourceIp ?: '\u2014') as String)}</td>")
                         html.append("<td style=\"padding:6px 0; opacity:0.8;\">${escapeHtml((s.sessionType ?: '\u2014') as String)}</td>")
@@ -874,7 +1455,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 // ── Drives card (v0.1.28; v0.1.33 enriched with HPE OEM fields) ──
                 def drives = (status.drives ?: []) as List
                 if (drives) {
-                    html.append('<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
+                    html.append('<div style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
                     html.append("<h3 style=\"margin:0 0 12px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;\">Drives &mdash; ${drives.size()}</h3>")
                     html.append('<table style="width:100%; font-size:12px; border-collapse:collapse;">')
                     html.append('<thead><tr style="opacity:0.55; font-size:10px; text-transform:uppercase; letter-spacing:0.05em;">')
@@ -905,7 +1486,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                         String lifeColor = (life != null && life < 10) ? '#d9534f' : ((life != null && life < 25) ? '#ffc107' : '#dbe6ef')
                         Long pohRaw = d.powerOnHours as Long
                         String poh = (pohRaw != null) ? humanizeHours(pohRaw) : '\u2014'
-                        html.append('<tr style="border-top:1px solid rgba(255,255,255,0.04);">')
+                        html.append('<tr style="border-top:1px solid var(--argus-border-soft);">')
                         html.append("<td style=\"padding:6px 12px 6px 0;\">${escapeHtml((d.model ?: '\u2014') as String)}</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; opacity:0.8;\">${escapeHtml(typ)}</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; opacity:0.7; font-family:ui-monospace,monospace; font-size:11px;\">${escapeHtml((d.location ?: '\u2014') as String)}</td>")
@@ -933,7 +1514,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 // the operation name and percent show in the status column.
                 List storVolumes = (status.volumes ?: []) as List
                 if (storVolumes) {
-                    html.append('<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
+                    html.append('<div style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
                     html.append("<h3 style=\"margin:0 0 12px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;\">Volumes &mdash; ${storVolumes.size()}</h3>")
                     html.append('<table style="width:100%; font-size:12px; border-collapse:collapse;">')
                     html.append('<thead><tr style="opacity:0.55; font-size:10px; text-transform:uppercase; letter-spacing:0.05em;">')
@@ -962,7 +1543,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                         if (v.encrypted) {
                             statusCell += ' &middot; <span style="opacity:0.7;">encrypted</span>'
                         }
-                        html.append('<tr style="border-top:1px solid rgba(255,255,255,0.04);">')
+                        html.append('<tr style="border-top:1px solid var(--argus-border-soft);">')
                         html.append("<td style=\"padding:6px 12px 6px 0;\">${escapeHtml(nameStr)}</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; opacity:0.7;\">${escapeHtml((v.controller ?: '\u2014') as String)}</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; font-family:ui-monospace,monospace;\">${escapeHtml(raidStr)}</td>")
@@ -980,7 +1561,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 // since most operators only care if something is hot.
                 def allTemps = (status.allTemperatures ?: []) as List
                 if (allTemps) {
-                    html.append('<details style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
+                    html.append('<details style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
                     html.append("<summary style=\"cursor:pointer; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;\">Cooling Zones &mdash; ${allTemps.size()} sensors</summary>")
                     html.append('<table style="width:100%; margin-top:10px; font-size:12px; border-collapse:collapse;">')
                     html.append('<thead><tr style="opacity:0.55; font-size:10px; text-transform:uppercase; letter-spacing:0.05em;">')
@@ -997,7 +1578,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                         String readColor = '#dbe6ef'
                         if (critAt && c >= critAt) readColor = '#d9534f'
                         else if (warnAt && c >= warnAt) readColor = '#ffc107'
-                        html.append('<tr style="border-top:1px solid rgba(255,255,255,0.04);">')
+                        html.append('<tr style="border-top:1px solid var(--argus-border-soft);">')
                         html.append("<td style=\"padding:6px 12px 6px 0;\">${escapeHtml((t.name ?: '\u2014') as String)}</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; opacity:0.7;\">${escapeHtml((t.physicalCtx ?: '\u2014') as String)}</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; text-align:right; font-family:ui-monospace,monospace; color:${readColor}; font-weight:600;\">${formatTemp(c)}</td>")
@@ -1011,7 +1592,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 // ── Firmware Inventory (v0.1.32) ──
                 def fw = (status.firmwareInventory ?: []) as List
                 if (fw) {
-                    html.append('<details style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
+                    html.append('<details style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
                     html.append("<summary style=\"cursor:pointer; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;\">Firmware Inventory &mdash; ${fw.size()} components</summary>")
                     html.append('<table style="width:100%; margin-top:10px; font-size:12px; border-collapse:collapse;">')
                     html.append('<thead><tr style="opacity:0.55; font-size:10px; text-transform:uppercase; letter-spacing:0.05em;">')
@@ -1021,7 +1602,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     html.append('</tr></thead><tbody>')
                     fw.sort { (it.name as String) }.each { f ->
                         Boolean upd = f.updateable as Boolean
-                        html.append('<tr style="border-top:1px solid rgba(255,255,255,0.04);">')
+                        html.append('<tr style="border-top:1px solid var(--argus-border-soft);">')
                         html.append("<td style=\"padding:6px 12px 6px 0;\">${escapeHtml((f.name ?: '\u2014') as String)}</td>")
                         html.append("<td style=\"padding:6px 12px 6px 0; font-family:ui-monospace,monospace; opacity:0.85;\">${escapeHtml((f.version ?: '\u2014') as String)}</td>")
                         html.append("<td style=\"padding:6px 0; opacity:0.7;\">${upd == true ? 'Yes' : (upd == false ? 'No' : '\u2014')}</td>")
@@ -1033,13 +1614,13 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 // ── Recent events (collapsible) ──
                 def events = (status.recentEvents ?: []) as List
                 if (events) {
-                    html.append('<details style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
+                    html.append('<details style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:10px 14px; margin-bottom:14px;">')
                     html.append('<summary style="cursor:pointer; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;">Recent Events &mdash; last ' + events.size() + '</summary>')
                     html.append('<table style="width:100%; margin-top:10px; font-size:11px; border-collapse:collapse;">')
                     events.each { e ->
                         String sev = (e.severity as String) ?: 'OK'
                         String sevColor = sev == 'Critical' ? '#d9534f' : (sev == 'Warning' ? '#ffc107' : '#7a8a98')
-                        html.append('<tr style="border-top:1px solid rgba(255,255,255,0.04);">')
+                        html.append('<tr style="border-top:1px solid var(--argus-border-soft);">')
                         html.append("<td style=\"padding:6px 10px 6px 0; opacity:0.55; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;\">${escapeHtml((e.created ?: '') as String)}</td>")
                         html.append("<td style=\"padding:6px 10px 6px 0; color:${sevColor}; font-weight:600; white-space:nowrap;\">${escapeHtml(sev)}</td>")
                         html.append("<td style=\"padding:6px 0;\">${escapeHtml((e.message ?: '') as String)}</td>")
@@ -1051,7 +1632,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
 
             // Configure-access card (only if not configured)
             if (!cfg.configured) {
-                html.append('<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
+                html.append('<div style="background:var(--argus-bg-card); border:1px solid var(--argus-border); border-radius:4px; padding:14px 16px; margin-bottom:14px;">')
                 html.append('<h3 style="margin:0 0 8px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; opacity:0.7;">Configure access</h3>')
                 html.append('<p style="margin:0 0 8px; font-size:12px;">This host has no iLO host or credential configured. Add these labels (Actions → Edit → Labels):</p>')
                 html.append('<ul style="margin:0; padding-left:18px; font-size:12px; line-height:1.7;">')
@@ -1066,8 +1647,8 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
             }
 
             // Diagnostics (collapsed by default)
-            html.append('<details style="background:rgba(255,255,255,0.01); padding:10px 14px; border-radius:4px; margin-top:14px;">')
-            html.append('<summary style="cursor:pointer; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; opacity:0.5;">Diagnostics (v0.1.35)</summary>')
+            html.append('<details style="background:var(--argus-bg-diag); padding:10px 14px; border-radius:4px; margin-top:14px;">')
+            html.append('<summary style="cursor:pointer; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; opacity:0.5;">Diagnostics (v0.1.43)</summary>')
             html.append('<table style="font-family:monospace; font-size:11px; width:100%; margin-top:10px;">')
             diag.each { k, v ->
                 html.append("<tr><td style=\"opacity:0.55; padding-right:24px; padding-bottom:2px;\">${escapeHtml(k as String)}</td><td>${escapeHtml(v?.toString())}</td></tr>")
@@ -1080,6 +1661,121 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
             String diagNonce = getCspNonce()
             String nonceStr = diagNonce ? "present (length=${diagNonce.length()}, one-click ENABLED)" : 'missing (one-click DISABLED, two-button manual flow active)'
             html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">cspNonce</td><td>${escapeHtml(nonceStr)}</td></tr>")
+            // v0.1.36 — surface plugin settings + the actual launch path
+            // taken this render. `launchAuthResolved` is the most useful row
+            // for triage: it tells you which strategy the Launch Console
+            // button is wired to right now.
+            html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">launchMode</td><td>${escapeHtml(argusSettings.launchMode as String)}</td></tr>")
+            html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">launchWindowMode</td><td>${escapeHtml(argusSettings.windowMode as String)}</td></tr>")
+            html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">launchAuthMethod</td><td>${escapeHtml(argusSettings.authMethod as String)} <span style=\"opacity:0.55;\">(setting)</span></td></tr>")
+            // v0.1.40 — settings-persistence diagnostics. Reports of all
+            // three checkboxes appearing inert even after v0.1.38's
+            // JsonSlurper fix mean we need to see what Morpheus is
+            // actually storing in the pluginConfig blob. Three rows so
+            // we can tell (A) Morpheus drops unchecked fields from JSON
+            // (v0.1.40 isOn() handles this) from (B) Morpheus persists
+            // defaultValue regardless of UI state (which would be a
+            // Morpheus bug we can't paper over).
+            String parsedKeysStr = (argusSettings._parsedKeys instanceof List)
+                    ? ((argusSettings._parsedKeys as List).join(', ') ?: '<empty>')
+                    : '<none>'
+            String configHasKeysStr = (argusSettings._configHasKeys as Boolean) ? 'yes' : 'no'
+            html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">settingsParsedKeys</td><td>${escapeHtml(parsedKeysStr)} <span style=\"opacity:0.55;\">(hasKeys=${escapeHtml(configHasKeysStr)})</span></td></tr>")
+            String rawA = (argusSettings._rawAutoLogin   != null) ? (argusSettings._rawAutoLogin   as String) : '<null>'
+            String rawP = (argusSettings._rawPopupWindow != null) ? (argusSettings._rawPopupWindow as String) : '<null>'
+            String rawS = (argusSettings._rawSessionkey  != null) ? (argusSettings._rawSessionkey  as String) : '<null>'
+            html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">settingsRaw</td><td>autoLogin=${escapeHtml(rawA)} &middot; popup=${escapeHtml(rawP)} &middot; sessionkey=${escapeHtml(rawS)}</td></tr>")
+            if (argusSettings._parseError) {
+                html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">settingsParseError</td><td>${escapeHtml(argusSettings._parseError as String)}</td></tr>")
+            }
+            // Raw JSON blob is most useful when the rest of the rows
+            // don't explain what's going on. Truncate to ~400 chars to
+            // avoid overflowing the diagnostics row on hosts with very
+            // large pluginConfig blobs (we've never seen big ones here
+            // but defensive limit).
+            if (argusSettings._rawJson) {
+                String rj = argusSettings._rawJson as String
+                if (rj.length() > 400) rj = rj.substring(0, 400) + '... (truncated)'
+                html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">settingsJson</td><td><code style=\"font-size:10px; word-break:break-all;\">${escapeHtml(rj)}</code></td></tr>")
+            }
+            // v0.1.38 — UID indicator LED action trace. Shows nothing on a
+            // plain page load (no param), shows the requested value plus
+            // success/failure on a render where the user just clicked one
+            // of the Off/Lit/Blink buttons in the System card.
+            //
+            // v0.1.39 — added the per-attempt breakdown (Systems/1 vs
+            // Chassis/1, IndicatorLED vs LocationIndicatorActive, plain
+            // vs +ETag, with Redfish MessageId on errors) so we can
+            // distinguish RBAC (every attempt same code) from firmware
+            // quirks (mixed codes) from value/property issues (specific
+            // MessageId like PropertyNotWritable). Also surfaces which
+            // property the badge READ came from in a separate row.
+            if (status?.uidActionRequested) {
+                String uidStr = "${status.uidActionRequested}${status.uidActionSuccess ? ' (success via ' + (status.uidActionPropertyUsed ?: '?') + ')' : ' (FAILED: ' + (status.uidActionError ?: 'unknown') + ')'}"
+                html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">uidAction</td><td>${escapeHtml(uidStr)}</td></tr>")
+            }
+            if (status?.uidActionAttempts) {
+                List uidAttempts = status.uidActionAttempts as List
+                StringBuilder atSb = new StringBuilder()
+                uidAttempts.eachWithIndex { Object item, int idx ->
+                    Map at = item as Map
+                    if (idx > 0) atSb.append(' &middot; ')
+                    String pathStr = (at.path as String) ?: '?'
+                    String propStr = (at.property as String) ?: 'IndicatorLED'
+                    // Compact label: omit IndicatorLED (it's the default)
+                    // and prefix LIA / OEM so the row stays readable on a
+                    // single line in the diagnostics table.
+                    String propTag
+                    if (propStr == 'LocationIndicatorActive') propTag = ' LIA'
+                    else if (propStr == 'Oem.Hpe.IndicatorLED') propTag = ' OEM'
+                    else propTag = ''
+                    String ifm     = (at.ifMatch as Boolean) ? ' +ETag' : ''
+                    String outcome
+                    if (at.success as Boolean) {
+                        outcome = 'ok'
+                    } else {
+                        String code = at.errorCode ? "HTTP ${at.errorCode}" : 'failed'
+                        String msgId = at.redfishMessageId ? " ${at.redfishMessageId}" : ''
+                        outcome = "${code}${msgId}"
+                    }
+                    atSb.append("${pathStr}${propTag}${ifm}: ${outcome}")
+                }
+                html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">uidActionAttempts</td><td>${escapeHtml(atSb.toString())}</td></tr>")
+            }
+            // v0.1.41 — iLO concurrent session pressure indicator. iLO 6
+            // typically caps at ~13 concurrent sessions across all clients
+            // (web UI, IRC console, REST API, sessionkey launches). Writes
+            // start failing with confusing PropertyNotWritableOrUnknown
+            // errors before reads do when the pool saturates, so this row
+            // gets a colored warning prefix when approaching the cap so
+            // operators see it before they spend time chasing fake
+            // "property not writable" or RBAC red herrings.
+            if (status?.totalSessionCount != null) {
+                int sessCount = status.totalSessionCount as int
+                String sessHint
+                String sessColor
+                if (sessCount >= 11) {
+                    sessHint = " &mdash; at or near iLO's ~13-session cap; close stale console windows before chasing UID PATCH errors"
+                    sessColor = '#c0392b'
+                } else if (sessCount >= 7) {
+                    sessHint = " &mdash; approaching iLO's ~13-session cap"
+                    sessColor = '#d4a017'
+                } else {
+                    sessHint = ''
+                    sessColor = null
+                }
+                String sessCell = sessColor
+                        ? "<span style=\"color:${sessColor};\">${sessCount}</span>${sessHint}"
+                        : "${sessCount}${sessHint}"
+                html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">iloSessions</td><td>${sessCell}</td></tr>")
+            }
+            if (status?.indicatorLed) {
+                String src = (status.indicatorLedSource as String) ?: 'IndicatorLED'
+                html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">indicatorLed</td><td>${escapeHtml(status.indicatorLed as String)} <span style=\"opacity:0.55;\">(current, via ${escapeHtml(src)})</span></td></tr>")
+            }
+            String launchTokenStr = launchToken ? "minted (length=${launchToken.length()})" : 'not minted'
+            html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">launchToken</td><td>${escapeHtml(launchTokenStr)}</td></tr>")
+            html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">launchAuthResolved</td><td>${escapeHtml(resolvedAuthMethod)}</td></tr>")
             // v0.1.32: surface drive-search diagnostic + device discovery
             // state so we can see at a glance why drives are/aren't showing.
             if (status?.deviceDiscovery) {
@@ -1109,7 +1805,26 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">powerTrend</td><td style=\"font-family:ui-monospace,monospace; font-size:11px;\">${escapeHtml(ptrendStr)}</td></tr>")
                 List naDiag = (status.networkAdapters ?: []) as List
                 int totalPortsDiag = (naDiag.sum { ((it.ports ?: []) as List).size() } ?: 0) as Integer
-                html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">networkAdapters</td><td style=\"font-family:ui-monospace,monospace; font-size:11px;\">${naDiag.size()} adapters, ${totalPortsDiag} ports</td></tr>")
+                // v0.1.36 — count NIC vs HBA ports for at-a-glance verification
+                // that the split classifier picked them up correctly.
+                int nicPortsDiag = 0
+                int hbaPortsDiag = 0
+                int unknownTechDiag = 0
+                naDiag.each { Map a ->
+                    String mdl = ((a.model ?: '') as String).toLowerCase()
+                    boolean adapterHbaLike = mdl =~ /\b(fc|hba|sas|fibre|fibrechannel|tri-mode|smart array)\b/
+                    ((a.ports ?: []) as List).each { Map prt ->
+                        String tech = ((prt.activeTech ?: '') as String)
+                        if (tech == 'Ethernet') nicPortsDiag++
+                        else if (tech == 'FibreChannel' || tech == 'InfiniBand') hbaPortsDiag++
+                        else if (adapterHbaLike) { hbaPortsDiag++; unknownTechDiag++ }
+                        else { nicPortsDiag++; unknownTechDiag++ }
+                    }
+                }
+                String naDiagStr = "${naDiag.size()} adapters, ${totalPortsDiag} ports (NIC=${nicPortsDiag}, HBA=${hbaPortsDiag}"
+                if (unknownTechDiag > 0) naDiagStr += ", ${unknownTechDiag} via model fallback"
+                naDiagStr += ")"
+                html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">networkAdapters</td><td style=\"font-family:ui-monospace,monospace; font-size:11px;\">${naDiagStr}</td></tr>")
                 List volDiag = (status.volumes ?: []) as List
                 html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">volumes</td><td style=\"font-family:ui-monospace,monospace; font-size:11px;\">${volDiag.size()} volume${volDiag.size() == 1 ? '' : 's'}</td></tr>")
             }
@@ -1140,7 +1855,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
         }
         return """<div>\
 <div style="font-size:10px; text-transform:uppercase; letter-spacing:0.05em; opacity:0.55; margin-bottom:4px;">${escapeHtml(label)}</div>\
-<div><span style="display:inline-block; padding:2px 10px; border-radius:10px; background:rgba(255,255,255,0.05); color:${color}; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.03em;">${escapeHtml(value ?: '?')}</span></div>\
+<div><span style="display:inline-block; padding:2px 10px; border-radius:10px; background:var(--argus-bg-pill); color:${color}; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.03em;">${escapeHtml(value ?: '?')}</span></div>\
 </div>"""
     }
 
@@ -1298,7 +2013,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
 
         StringBuilder svg = new StringBuilder()
         svg.append('<div style="flex:1; min-width:240px;">')
-        svg.append("<svg viewBox=\"0 0 ${w} ${h}\" preserveAspectRatio=\"none\" style=\"width:100%; height:70px; display:block; background:rgba(255,255,255,0.02); border-radius:3px;\">")
+        svg.append("<svg viewBox=\"0 0 ${w} ${h}\" preserveAspectRatio=\"none\" style=\"width:100%; height:70px; display:block; background:var(--argus-bg-card); border-radius:3px;\">")
         svg.append("<polygon points=\"${areaPts.toString()}\" fill=\"rgba(1,169,130,0.18)\" stroke=\"none\"/>")
         svg.append("<polyline points=\"${pts.toString()}\" fill=\"none\" stroke=\"#01A982\" stroke-width=\"1.5\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>")
         svg.append('</svg>')
@@ -1436,5 +2151,32 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
             // Spring classes not available, or unexpected error
         }
         return ''
+    }
+
+    /**
+     * v0.1.38 — Read a query-string parameter off the current
+     * HttpServletRequest. Mirrors getCspNonce() exactly: same Spring
+     * RequestContextHolder dance, same Groovy dynamic dispatch, same
+     * silent-failure semantics. Used by the UID indicator LED control
+     * to read argusUidAction from the URL the user just navigated to
+     * by clicking a button in the System card.
+     *
+     * Returns null on any failure (Spring classes absent, no active
+     * request context, parameter not present). Caller defaults to "no
+     * action" — the tab simply renders normally without doing a PATCH.
+     */
+    private static String getRequestParam(String name) {
+        try {
+            Class<?> holderClass = Class.forName('org.springframework.web.context.request.RequestContextHolder')
+            def attrs = holderClass.getMethod('getRequestAttributes').invoke(null)
+            if (attrs == null) return null
+            def req = attrs.getRequest()
+            if (req == null) return null
+            def v = req.getParameter(name)
+            return v ? v.toString() : null
+        } catch (Throwable t) {
+            // Spring classes not available, or unexpected error
+        }
+        return null
     }
 }

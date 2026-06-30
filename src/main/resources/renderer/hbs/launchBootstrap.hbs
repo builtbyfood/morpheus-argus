@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Launching iLO console&hellip;</title>
+    <style nonce="{{nonce}}">
+        html, body { margin:0; padding:0; height:100%; background:#0f1316; color:#cfd6dc; font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
+        .wrap { display:flex; align-items:center; justify-content:center; height:100%; }
+        .card { text-align:center; max-width: 460px; padding: 32px; }
+        h1 { font-size: 18px; font-weight: 500; margin: 0 0 8px; }
+        p { font-size: 14px; color:#8b949e; margin: 4px 0; }
+        .err { color:#ff7b72; }
+        .spinner { display:inline-block; width:24px; height:24px; border:2px solid #30363d; border-top-color:#58a6ff; border-radius:50%; animation: spin 0.8s linear infinite; margin: 12px auto; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .retry { color:#58a6ff; text-decoration: underline; cursor: pointer; background: none; border: 0; font: inherit; }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="card" id="card">
+        <div class="spinner" id="spinner"></div>
+        <h1 id="title">Connecting to iLO&hellip;</h1>
+        <p id="detail">Authenticating against the iLO management processor.</p>
+    </div>
+</div>
+
+<script nonce="{{nonce}}">
+(function() {
+    // Nonce is base64url (A–Z, a–z, 0–9, -, _) so safe to splice as a quoted string.
+    const nonce = "{{object.nonce}}";
+    const title = document.getElementById('title');
+    const detail = document.getElementById('detail');
+    const spinner = document.getElementById('spinner');
+
+    function fail(msg) {
+        spinner.style.display = 'none';
+        title.textContent = 'Console launch failed';
+        title.className = 'err';
+        detail.textContent = msg;
+    }
+
+    // 1. Redeem the single-use nonce for credentials.
+    fetch('/plugin/iloConsole/launch/creds?nonce=' + encodeURIComponent(nonce || ''), {
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json' }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(payload) {
+        if (!payload || !payload.success) {
+            fail((payload && payload.error) || 'Failed to redeem launch token.');
+            return;
+        }
+        title.textContent = 'Signing in to iLO ' + payload.iloHost + '\u2026';
+        detail.textContent = 'Establishing the iLO web session.';
+
+        // 2. POST to the iLO web UI's login endpoint with credentials:include
+        //    so the resulting sessionKey cookie lands on the iLO origin.
+        //    iLO 5/6/7 keep the legacy /json/login_session endpoint for this
+        //    purpose; the modern Redfish session is a different mechanism and
+        //    is NOT what the HTML5 IRC reads from.
+        var body = JSON.stringify({
+            method: 'login',
+            user_login: payload.username,
+            password: payload.password
+        });
+        // Clear references to the password from the JS variable as soon as we
+        // hand it to fetch — it now lives only in the underlying request body
+        // until the iLO accepts it.
+        payload.password = null;
+
+        return fetch('https://' + payload.iloHost + '/json/login_session', {
+            method: 'POST',
+            credentials: 'include',
+            mode: 'cors',
+            headers: { 'Content-Type': 'application/json' },
+            body: body
+        }).then(function(r) {
+            if (!r.ok) throw new Error('iLO rejected login (HTTP ' + r.status + ')');
+            // 3. Navigate to the standalone HTML5 IRC. The session cookie set
+            //    by step 2 authenticates the page.
+            window.location.replace('https://' + payload.iloHost + '/irc.html');
+        });
+    })
+    .catch(function(err) {
+        var msg = err && err.message ? err.message : String(err);
+        // The most common failure here is the user not having accepted the
+        // iLO's self-signed cert in this browser, which manifests as a
+        // network error / opaque fetch failure.
+        fail(msg + ' \u2014 you may need to accept the iLO TLS certificate first by visiting https://<ilo-host>/ directly, then retry.');
+    });
+})();
+</script>
+</body>
+</html>

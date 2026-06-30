@@ -1,0 +1,90 @@
+<style nonce="{{nonce}}">
+    #ilo-tab { font-size: 13px; line-height: 1.5; }
+    #ilo-tab h2 { margin: 0 0 4px; font-size: 16px; font-weight: 500; }
+    #ilo-tab .detected { color: rgba(255,255,255,0.6); font-size: 12px; margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    #ilo-tab .card { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 4px; padding: 16px 18px; margin-bottom: 14px; }
+    #ilo-tab .card h3 { margin: 0 0 10px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.85; }
+    #ilo-tab .kv-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px 24px; }
+    #ilo-tab .kv .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.5; display: block; }
+    #ilo-tab .kv .v { font-size: 14px; font-weight: 500; }
+    #ilo-tab .err { border-left: 3px solid #d9534f; background: rgba(217,83,79,0.08); padding: 10px 12px; margin-top: 10px; }
+    #ilo-tab code { background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    #ilo-tab .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+    #ilo-tab .pill.ok  { background: rgba(40,167,69,0.15); color: #28a745; }
+    #ilo-tab .pill.warn { background: rgba(255,193,7,0.15); color: #ffc107; }
+    #ilo-tab .pill.bad { background: rgba(217,83,79,0.15); color: #d9534f; }
+    #ilo-tab .diag-table { font-size: 11px; font-family: monospace; width: 100%; border-collapse: collapse; }
+    #ilo-tab .diag-table td { padding: 2px 12px 2px 0; }
+    #ilo-tab .diag-table td.k { opacity: 0.6; }
+</style>
+
+<div id="ilo-tab">
+
+    <h2>iLO Console</h2>
+    <div class="detected">
+        {{#if object.vendor}}Detected: {{object.vendor}}{{#if object.model}} &middot; {{object.model}}{{/if}}{{#if object.serial}} &middot; S/N {{object.serial}}{{/if}}{{else}}No vendor/model fields could be read from this host record (server id: {{object.serverId}}).{{/if}}
+    </div>
+
+    {{#if object.errorMsg}}
+    <div class="card err">
+        <strong>iLO error:</strong> {{object.errorMsg}}
+        {{#if object.credSource}}<div style="font-size:11px; opacity:0.7; margin-top:4px;">credential lookup path: {{object.credSource}}</div>{{/if}}
+    </div>
+    {{/if}}
+
+    {{#unless object.configured}}
+    <div class="card">
+        <h3>Configure access</h3>
+        <p>This host has no iLO host or credential set. iLOs live on a separate management network, so they can't be auto-discovered from the OS NIC.</p>
+        <p>Add these <strong>labels</strong> to this server (Actions &rarr; Edit &rarr; Labels):</p>
+        <ul>
+            <li><code>ilo-host:&lt;ip-or-hostname&gt;</code> &mdash; example: <code>ilo-host:10.0.50.42</code></li>
+            <li><code>ilo-cred:&lt;credential-id&gt;</code> &mdash; the numeric ID of a credential under Infrastructure &rarr; Trust &rarr; Credentials (visible in the URL when editing it)</li>
+            <li><code>ilo-verify-ssl:true</code> (optional) &mdash; default is off for self-signed iLO certs</li>
+        </ul>
+        {{#if object.rawLabelsCsv}}
+        <p style="opacity:0.7; font-size:12px; margin-top:14px;">Labels currently on this host: <code>{{object.rawLabelsCsv}}</code></p>
+        {{/if}}
+    </div>
+    {{/unless}}
+
+    {{#if object.configured}}
+    <div class="card">
+        <h3>Status</h3>
+        {{#if object.statusSuccess}}
+        <div class="kv-grid">
+            <div class="kv"><span class="k">Power</span><span class="v"><span class="pill {{object.powerClass}}">{{object.powerState}}</span></span></div>
+            <div class="kv"><span class="k">Health</span><span class="v"><span class="pill {{object.healthClass}}">{{object.health}}</span></span></div>
+            <div class="kv"><span class="k">iLO</span><span class="v">{{object.iloModel}}{{#if object.iloFirmware}} &middot; {{object.iloFirmware}}{{/if}}</span></div>
+            <div class="kv"><span class="k">BIOS</span><span class="v">{{object.biosVersion}}</span></div>
+            <div class="kv"><span class="k">CPU</span><span class="v">{{object.cpuCount}}&times; {{object.cpuModel}}</span></div>
+            <div class="kv"><span class="k">Memory</span><span class="v">{{object.memoryGiB}} GiB</span></div>
+        </div>
+        {{/if}}
+    </div>
+    {{/if}}
+
+    <div class="card">
+        <h3>Diagnostics (v0.1.13)</h3>
+        <p style="font-size:11px; opacity:0.6; margin:0 0 10px;">If this card shows real values, renderTemplate() is finally being called.</p>
+        <table class="diag-table">
+            <tr><td class="k">paramNull</td><td>{{object.diag.paramNull}}</td></tr>
+            <tr><td class="k">paramClass</td><td>{{object.diag.paramClass}}</td></tr>
+            <tr><td class="k">directId</td><td>{{object.diag.directId}}</td></tr>
+            <tr><td class="k">directName</td><td>{{object.diag.directName}}</td></tr>
+            <tr><td class="k">directVendor</td><td>{{object.diag.directVendor}}</td></tr>
+            <tr><td class="k">directModel</td><td>{{object.diag.directModel}}</td></tr>
+            <tr><td class="k">getterIdThrew</td><td>{{object.diag.getterIdThrew}}</td></tr>
+            <tr><td class="k">propsKeyCount</td><td>{{object.diag.propsKeyCount}}</td></tr>
+            <tr><td class="k">propsHasId</td><td>{{object.diag.propsHasId}}</td></tr>
+            <tr><td class="k">propsHasVendor</td><td>{{object.diag.propsHasVendor}}</td></tr>
+            <tr><td class="k">idFromProps</td><td>{{object.diag.idFromProps}}</td></tr>
+            <tr><td class="k">vendorFromProps</td><td>{{object.diag.vendorFromProps}}</td></tr>
+            <tr><td class="k">modelFromProps</td><td>{{object.diag.modelFromProps}}</td></tr>
+            <tr><td class="k">propsThrew</td><td>{{object.diag.propsThrew}}</td></tr>
+            <tr><td class="k">infoSource</td><td>{{object.infoSource}}</td></tr>
+            <tr><td class="k">labels (csv)</td><td>{{object.rawLabelsCsv}}</td></tr>
+        </table>
+    </div>
+
+</div>

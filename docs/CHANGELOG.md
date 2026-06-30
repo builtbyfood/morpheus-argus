@@ -4,6 +4,794 @@ All notable changes to the `morpheus-ilo-console` plugin. The version numbers
 trace the actual iteration history; lessons learned at each step are summarized
 in the `Notes` rows because they explain why the next version exists.
 
+## 0.1.43 — Release prep: privilege docs corrected, README freshened, posting artifacts added
+
+Polish-only release ahead of the GitHub push. Field testing on the same
+iLO that originally returned 403 on UID PATCH (v0.1.38) now succeeds
+without any extra iLO privilege beyond Login + Remote Console. The
+v0.1.38 → v0.1.39 hypothesis that "Configure iLO Settings" privilege
+was required appears to have been wrong — the original 403 was almost
+certainly session-pressure (v0.1.41 documented the failure mode), and
+the privilege change was coincident rather than causal. Correcting the
+docs so future users don't grant write privileges they don't actually
+need.
+
+### What changed
+
+- **Fixed (docs).** Removed the "Configure iLO Settings privilege
+  required" claim from TROUBLESHOOTING.md and from the inline 403
+  hint in `setIndicatorLed()`. Field testing on iLO 5 / iLO 6 / iLO 7
+  with an account that has only Login + Remote Console privileges
+  confirmed UID writes succeed via `LocationIndicatorActive` and
+  `Oem.Hpe.IndicatorLED`. The new docs section emphasizes checking
+  the `iloSessions` row first, then escalating iLO RBAC as a
+  diagnostic only if session pressure isn't the cause.
+- **Updated (docs).** README refreshed for the mature feature set —
+  System card now mentions UID control buttons, the diagnostics row
+  list includes plugin settings forensics and concurrent-session
+  pressure, the install snippet references v0.1.43, and tested-
+  against now lists MicroServer Gen10 Plus, MicroServer Gen11, and
+  DL325 Gen12. Cooling Zones and Firmware Inventory rows added to
+  the feature table (they shipped earlier but were missing from the
+  table).
+- **Added.** `docs/RELEASE_NOTES.md` — consolidated GitHub release
+  page content covering v0.1.35 → v0.1.43 highlights, install
+  instructions, compatibility matrix, and a "what's NOT in this
+  release" section to set expectations on deferred work.
+- **Added.** `docs/LINKEDIN_POST.md` — two variants of the
+  announcement post (short ~150-word headline, long ~400-word deep
+  dive), first-comment text, hashtag pool, and posting-strategy
+  notes including image scrubbing requirements.
+
+### Notes
+
+- **Operators should grant privileges that the plugin actually
+  requires, not privileges the plugin documentation guessed at.**
+  v0.1.38 docs over-specified by claiming a write privilege that
+  isn't actually needed for the modern write path (the OEM
+  property). The correction matters because least-privilege is the
+  right default for BMC accounts — granting "Configure iLO Settings"
+  to a Morpheus-managed account opens up much more than just UID
+  control. v0.1.43 docs say "Login + Remote Console works in our
+  testing" and direct users to confirm via the diagnostics rows
+  before escalating.
+- **Session pressure was almost certainly the cause of the original
+  v0.1.38 403.** Closing other console windows fixed the same PATCH
+  call without any RBAC change. The pattern from this whole
+  iteration sequence: when a failure looks like RBAC but isn't
+  reproducible after a state reset (closed sessions, fresh tab
+  render), it's almost certainly not RBAC. RBAC failures are
+  deterministic; session-pressure failures aren't.
+
+## 0.1.42 — Settings actually load (RxJava 3 blockingGet, not RxJava 2 toBlocking)
+
+Fourth iteration on the same bug. v0.1.41 fixed the method name from
+`getPluginConfig()` to `getSettings(this)` per the Morpheus docs but
+called `.toBlocking().firstOrDefault(null)` on the return value — the
+RxJava 2 idiom. Morpheus is running on RxJava 3, and `getSettings(this)`
+returns a `Single<String>` which has `blockingGet()` instead of
+`toBlocking()`. The v0.1.41 forensics row surfaced the exact
+exception:
+
+```
+No signature of method:
+io.reactivex.rxjava3.internal.operators.single.SingleJust.toBlocking()
+is applicable for argument types: () values: []
+Possible solutions: toString(), toString()
+```
+
+### What changed
+
+- **Fixed.** `readArgusSettings()` uses `morpheus.getSettings(this).blockingGet()`,
+  the RxJava 3 equivalent. Falls back to the doc-snippet `subscribe()`
+  pattern if `blockingGet()` is missing for any reason (defensive
+  against future RxJava version changes). Combined with v0.1.41's
+  correct method name and v0.1.40's defensive `isOn()`, the settings
+  page now actually changes runtime behavior. Save the page with a
+  checkbox unchecked, refresh the iLO tab, and the corresponding
+  `launchMode` / `launchWindowMode` / `launchAuthMethod` row in
+  Diagnostics flips immediately.
+
+### Notes
+
+- **The forensics diagnostic is now the most important debugging
+  feature in this plugin.** Three of the last four releases have been
+  bug-fix iterations on the same area, and each one converged on the
+  real bug in one round because the visible exception message named
+  the actual problem. The lesson generalizes: a `try/catch` that
+  swallows an exception should always surface that exception in a
+  diagnostic row, even if the user-facing output doesn't show it. The
+  cost is one HTML row and the upside is not paying for four
+  iterations to find a one-line bug.
+- **The Morpheus docs snippet uses `subscribe()` precisely because it
+  works on any RxJava version.** The doc-snippet pattern is verbose
+  but version-agnostic. `blockingGet()` (RxJava 3) and
+  `toBlocking().value()` (RxJava 2) are both shorter but tied to a
+  specific RxJava major version. Defensive plugin code should either
+  use the docs snippet verbatim or do what v0.1.42 does — try the
+  shorter idiom first, fall back to subscribe() on
+  MissingMethodException. The shortcut isn't worth a release of churn
+  for someone discovering the same incompatibility.
+- **Plugin-API version is not RxJava version.** Morpheus's
+  `morpheus-plugin-api` Maven artifact is at 1.3.1 — but that's the
+  plugin contract version, not the runtime RxJava version. The
+  runtime can swap RxJava 2 for RxJava 3 without bumping the plugin
+  API version, because the plugin contract just specifies "returns
+  some reactive Single<String>" without naming the package. Don't
+  assume API version pins runtime library versions.
+
+## 0.1.41 — Settings API actually called correctly; iLO session-limit failure mode documented
+
+Two findings from v0.1.40 field testing. First, v0.1.40's settings-
+forensics diagnostic surfaced the actual exception that had been
+silently swallowed since v0.1.37: `No signature of method:
+com.morpheus.plugin.MorpheusContextImplService.getPluginConfig() is
+applicable for argument types: () values: []`. The method we'd been
+calling for three releases (`morpheus.getPluginConfig()`) doesn't
+exist on the Morpheus runtime context. The correct method per
+Morpheus's official plugin docs is `morpheus.getSettings(plugin)`.
+
+Second, field-confirmed that UID PATCH failures with
+`iLO.2.37.PropertyNotWritableOrUnknown` on otherwise-functional iLO
+firmware are a session-pressure symptom. Closing other open console
+windows (which were holding iLO sessions) made the same PATCH start
+working. Explains why the same plugin version flipped working/broken
+between defender and scorcher across recent test cycles.
+
+### What changed
+
+- **Fixed.** Settings persistence actually works. v0.1.41 calls the
+  correct Morpheus API: `morpheus.getSettings(this)` instead of the
+  nonexistent `morpheus.getPluginConfig()`. The defensive isOn() from
+  v0.1.40 is preserved as a safety net for cases where Morpheus
+  drops unchecked CHECKBOX fields from the persisted JSON. Combined,
+  toggling any of the three checkboxes and saving now actually
+  changes the runtime behavior on the next tab render — the
+  `launchMode`, `launchWindowMode`, and `launchAuthMethod`
+  diagnostics rows flip in real time, providing a trivial way to
+  verify the fix.
+
+- **Documented.** iLO concurrent-session limit interaction with the
+  plugin. iLO 6 typically allows up to 13 concurrent sessions across
+  all clients (web UI, IRC console, REST API, sessionkey-based
+  launches). When at or near the limit, the plugin's PATCH operations
+  start returning `iLO.2.37.PropertyNotWritableOrUnknown` even
+  though reads keep working — the symptom looks identical to the
+  RBAC-misconfigured case from v0.1.38, but is actually a transient
+  session-pressure failure. The fix is operational, not in code:
+  close stale console windows, or wait for sessions to time out.
+  New TROUBLESHOOTING section walks through the symptom and the
+  diagnostic signals (the `iloSessions` row in Diagnostics tells you
+  how many sessions are currently active).
+
+### Notes
+
+- **Always read the official plugin API docs to confirm method
+  signatures.** v0.1.37 → v0.1.40 spent four releases iterating on a
+  method that didn't exist. The actual API is documented in
+  Morpheus's "Getting Started with Custom Instance Tabs" guide
+  (docs.morpheusdata.com), and the snippet there is one of the
+  shortest sections of the page — three lines of Groovy. Web search
+  ahead of guess-and-check would have caught this at v0.1.37.
+- **Diagnostic rows that surface the exception text are worth their
+  weight in gold.** The v0.1.40 forensics diagnostic existed solely
+  to confirm what Morpheus was persisting — but it also surfaced
+  the never-before-seen MissingMethodException because the `try`
+  block stored the error message in `parseError`. Without that row,
+  v0.1.41 would still be guessing about a "Morpheus persistence
+  bug" that doesn't exist. Lesson: catch blocks that silently
+  swallow exceptions should always surface the exception message
+  in a debug diagnostic somewhere, even if the rendered output
+  doesn't show it by default.
+- **iLO has a hard cap on concurrent sessions (typically 13 on iLO
+  6). Writes start failing before reads do.** The plugin opens an
+  iLO session on every tab render (to mint a sessionkey for console
+  launch), and console launches via sessionkey URL open another
+  short-lived session. Repeated tab loads + active console windows
+  can stack 8-10 sessions on a busy operational workflow. PATCH
+  operations seem to fail first when the session pool is saturated,
+  returning misleading "property not writable" errors. Reads
+  continue to succeed, which makes the failure look like a code/RBAC
+  problem rather than a session-pressure problem. The
+  `iloSessions` diagnostics row is the tell.
+
+## 0.1.40 — HPE OEM UID property + settings-persistence forensics
+
+Two follow-ups from v0.1.39 field testing. First, after the iLO account
+gained "Configure iLO Settings" privilege, the UID PATCH started
+returning `iLO.2.37.PropertyNotWritableOrUnknown` on all six v0.1.39
+probe steps — both DMTF `IndicatorLED` and `LocationIndicatorActive`
+are read-only on this firmware. HPE's iLO 6 changelog confirms they
+moved the writable Lit/Blinking/Off property to `Oem.Hpe.IndicatorLED`
+as an explicit fallback for clients that don't want to switch to the
+boolean DMTF property. Second, every plugin-settings checkbox reads
+as "on" regardless of UI state even after v0.1.38's JsonSlurper fix —
+forensics diagnostics added so we can see exactly what Morpheus
+persists, plus a defensive smarter `isOn()` that handles the most
+likely cause (Morpheus omitting unchecked fields from the JSON blob).
+
+### What changed
+
+- **Improved.** UID PATCH probe chain extended from 6 → 8 steps with
+  HPE's OEM property as the final fallback:
+    7. `PATCH /Systems/1 {Oem: {Hpe: {IndicatorLED: <value>}}}`.
+    8. `PATCH /Chassis/1 {Oem: {Hpe: {IndicatorLED: <value>}}}`.
+  Per HPE's iLO 6 Redfish changelog: *"Added Oem.Hpe.IndicatorLED:
+  ... This is a fallback added for clients that want to continue to
+  use IndicatorLED."* On iLO 6 firmware where DMTF `IndicatorLED` is
+  read-only and `LocationIndicatorActive` also rejects writes (the
+  v0.1.39 field-report scenario), this OEM property is the writable
+  one. Body shape is the nested-OEM form. The diagnostics row tags
+  these attempts with ` OEM` so they're visually distinct from the
+  DMTF attempts.
+
+- **Improved.** UID badge READ now falls back to `Oem.Hpe.IndicatorLED`
+  when both `IndicatorLED` and `LocationIndicatorActive` are
+  null/Unknown. Full read order: DMTF `IndicatorLED` (Chassis then
+  System) → `LocationIndicatorActive` (Chassis then System) →
+  `Oem.Hpe.IndicatorLED` (Chassis then System). On firmware where
+  only the OEM property is populated, the badge now shows the actual
+  Lit/Blinking/Off state instead of an em-dash.
+
+- **Improved.** UID 400 hint now distinguishes "all 8 attempts failed
+  with PropertyNotWritable" (genuinely no writable UID property on
+  this firmware) from the v0.1.39 "may have moved to an HPE OEM
+  endpoint" hint (which is now what step 7/8 actually probes). The
+  new message points users straight at filing a GitHub issue with
+  firmware version, because the plugin has exhausted everywhere we
+  know to look.
+
+- **Improved.** Plugin-settings diagnostics. New rows in the
+  Diagnostics block surface the raw JSON Morpheus persists in
+  pluginConfig, plus what we parsed out of it:
+    - `settingsParsedKeys` — comma-separated keys present in the
+      parsed Map, plus a `hasKeys` boolean for first-install
+      detection.
+    - `settingsRaw` — each setting's raw value as Morpheus stored
+      it, separately for each of the three checkboxes. `<null>` means
+      the key is entirely absent.
+    - `settingsJson` — the raw JSON blob from
+      `morpheus.getPluginConfig()`, truncated to 400 chars.
+    - `settingsParseError` — present only when JsonSlurper threw.
+  Saving the Settings page with different checkbox combinations now
+  shows immediately whether Morpheus is dropping unchecked fields
+  from the JSON (the v0.1.40 defensive `isOn()` handles this) or
+  persisting `defaultValue` regardless of UI state (a Morpheus bug
+  no plugin-side fix can paper over).
+
+- **Improved.** `readArgusSettings()` smarter `isOn(null)`. Previous
+  behavior treated every missing key as "default-on", which is
+  correct only on a truly fresh install. v0.1.40 looks at whether
+  the config Map has ANY saved keys: if yes, missing keys are
+  treated as `false` (user explicitly unchecked and Morpheus dropped
+  the field); if no, missing keys are treated as `true` (fresh
+  install, defaults apply). This correctly handles the most likely
+  cause of the v0.1.39 reports — assuming Morpheus is in fact
+  dropping unchecked fields from JSON, which the new diagnostics
+  will confirm or refute.
+
+### Notes
+
+- **HPE iLO 6 has THREE UID-related properties.** DMTF top-level
+  `IndicatorLED` (read-only on modern firmware, kept for backward
+  compat), DMTF `LocationIndicatorActive` (boolean, may also be
+  read-only on some firmware), and HPE OEM `Oem.Hpe.IndicatorLED`
+  (Lit/Blinking/Off enum, explicitly the writable fallback per HPE's
+  own changelog). Modern firmware writes go through the OEM property.
+  Don't assume DMTF properties are the "right" answer — HPE moved
+  the writable bit by design.
+- **Morpheus plugin-settings CHECKBOX persistence is opaque.** We
+  can't tell from the plugin side what Morpheus stores when a user
+  unchecks a CHECKBOX with `defaultValue: 'on'`. Possibilities:
+  field dropped, field set to `false`, field set to defaultValue
+  regardless. Adding diagnostics that show the raw JSON is the only
+  way to find out without source access to Morpheus's form handler.
+  Lesson for future settings work: always emit a raw-config
+  diagnostics row from the first version that introduces settings —
+  the cost is one HTML row and it pays off the moment anyone reports
+  a "settings don't work" issue.
+- **HPE AMS agent is required for drive enumeration on KVM
+  hypervisor hosts.** Drives populate the iLO Storage collection
+  only when the AMS agent runs on the host OS and reports drive
+  inventory back to iLO via the CHIF channel. Without AMS, the
+  Drives card is empty even on hosts with healthy drives — this is
+  a documented HPE behavior, not a plugin bug. Documented in
+  TROUBLESHOOTING.md.
+- **The `hpilo` kernel driver emits `Open could not dequeue a packet`
+  warnings as expected noise.** These appear in `dmesg` or
+  `journalctl -k` on hosts where AMS or other userspace tools open
+  the iLO CHIF channel. The messages are informational and do not
+  indicate a plugin or hardware fault. Documented in TROUBLESHOOTING.md.
+
+## 0.1.39 — Window-mode actually opens tabs; UID PATCH probes harder before blaming RBAC
+
+Two follow-ups from v0.1.38 testing. The "Open in Popup Window" checkbox
+was being read correctly, but unchecking it still opened a popup window
+because of a bad features-string choice on the JS side. And the new UID
+buttons were returning 403 on every attempt, which v0.1.38 surfaced as
+the unhelpful banner "UID change failed: iLO returned 403" with no
+guidance about why or what to do.
+
+### What changed
+
+- **Fixed.** Window mode setting now actually takes effect. v0.1.38 passed
+  `'noopener'` as the `window.open` features string for tab mode. That's
+  a non-empty features string, and a non-empty features string forces
+  popup-window behavior in Chrome, Edge, and Firefox regardless of
+  which keywords it contains — `noopener` is a security flag, not a
+  tab-vs-window control. The fix is to pass `''` for tab mode. While
+  fixing that, also addressed a secondary issue: even with empty
+  features, a NAMED target (`iloConsole_${server.id}`) was being reused
+  across clicks, so a previously-opened popup window would still get
+  reused on subsequent clicks even after the user switched to tab mode.
+  Tab mode now uses `_blank` for the link flow (sessionkey URL,
+  link-only) and a fresh `iloConsole_<id>_<timestamp>` per click for
+  the form-POST flow (which needs a named target to pin form.target +
+  pre-opened window together). Each click opens a brand-new tab; no
+  reuse. The `rel="noopener"` on every `<a>` tag preserves the
+  opener-isolation we wanted from the `noopener` keyword.
+
+- **Fixed.** Open Console button now honors window mode too. Previously
+  it was a plain `<a target rel="noopener">` link with no JS
+  interception, so the browser's default click handler ignored the
+  windowMode setting and just opened wherever the browser preferred.
+  Added `data-argus-launch="1"` so the existing JS handler picks it up
+  alongside Launch Console.
+
+- **Improved.** UID PATCH now walks a 6-step probe chain instead of the
+  2-step v0.1.38 chain (Systems/1 plain → Chassis/1 plain). The new
+  chain adds an `If-Match: *` retry on each IndicatorLED endpoint AND
+  two `LocationIndicatorActive` fallback attempts on the DMTF newer
+  boolean property — some iLO 6 firmware (notably 1.5+ on Gen11) made
+  IndicatorLED read-only and only accepts writes via the new property:
+    1. `PATCH /Systems/1 {IndicatorLED}` (no If-Match).
+    2. `PATCH /Systems/1 {IndicatorLED} + If-Match: *`.
+    3. `PATCH /Chassis/1 {IndicatorLED}` (no If-Match).
+    4. `PATCH /Chassis/1 {IndicatorLED} + If-Match: *`.
+    5. `PATCH /Systems/1 {LocationIndicatorActive: bool}` (Off→false,
+       Lit/Blinking→true).
+    6. `PATCH /Chassis/1 {LocationIndicatorActive: bool}`.
+  The If-Match retry is there because some Redfish implementations
+  require ETag concurrency on PATCH and return 403 (rather than the
+  spec-correct 412) when it's missing. The wildcard `*` matches any
+  current ETag, so it's safe to add unconditionally; servers that
+  don't require If-Match ignore the header. The six attempts and
+  their HTTP outcomes are now recorded in a `uidActionAttempts`
+  diagnostics row so it's clear from the tab whether everything
+  returned the same code (RBAC) or different codes (firmware quirk)
+  or specific Redfish errors (property/value issues).
+
+- **Improved.** UID PATCH errors now capture the Redfish error
+  `MessageId` from iLO's response body (`error.@Message.ExtendedInfo[0].MessageId`)
+  and surface it both on the inline banner and the diagnostics row.
+  Standard Redfish servers return identifiers like
+  `Base.1.0.PropertyNotWritable` or `Base.1.0.PropertyValueNotInList`
+  in error responses — these are immediately actionable signals about
+  which fallback the plugin should try next. v0.1.38 threw the
+  response body away and only retained the HTTP code, which made 400
+  responses uniformly unhelpful.
+
+- **Improved.** UID 400 banner now identifies the most likely root
+  cause based on the Redfish MessageId. `PropertyNotWritable` or
+  `PropertyReadOnly` → "IndicatorLED is read-only on this firmware and
+  LocationIndicatorActive was also rejected — property may have moved
+  to an HPE OEM endpoint. File a GitHub issue." `PropertyValueNotInList`
+  or `PropertyValueTypeError` → "The value '<value>' isn't accepted by
+  this firmware — try a different button (some firmware supports only
+  Off/Blinking, not Lit)." 401, 403, 404, 405 also get tailored
+  messages. The full per-attempt list still goes into the Diagnostics
+  row for debugging firmware-specific weirdness.
+
+- **Fixed.** Read-side fallback for the UID badge. v0.1.38 read only
+  `IndicatorLED` from Chassis/1 and Systems/1; when both came back
+  null or "Unknown", the badge showed an em-dash. iLO 6 1.74+ on
+  Gen11 populates `LocationIndicatorActive` (boolean) instead, so the
+  badge stayed "Unknown" even on systems where UID was clearly active.
+  v0.1.39 falls back to LocationIndicatorActive when IndicatorLED
+  doesn't yield a usable value, mapping `true` → 'Lit' and `false` →
+  'Off'. The badge now reflects reality on these firmware revisions.
+  A new `indicatorLedSource` diagnostics annotation shows which
+  property the badge value came from (IndicatorLED or
+  LocationIndicatorActive). Caveat: LocationIndicatorActive is a
+  boolean, so when the badge comes from there we can't distinguish
+  Lit (steady) from Blinking — both report as 'Lit'.
+
+### Notes
+
+- **A non-empty `window.open` features string forces popup behavior in
+  every modern browser.** This includes strings containing ONLY
+  security keywords like `noopener` or `noreferrer`. Don't use those
+  in the features string to convey intent; put them in `rel=""` on
+  the `<a>` tag instead. For tab behavior, the features string must
+  be the empty string `''`, full stop.
+- **Named `window.open` targets reuse existing windows of that name,
+  including their original type.** If a popup-style window with the
+  given name is already open, calling `window.open(url, name,
+  emptyFeatures)` will reuse the popup window, not open a fresh tab.
+  Per-click unique names (timestamp suffix) are the workaround when
+  you need a named target but also want fresh windows.
+- **iLO sometimes returns 403 where the Redfish spec says 412 should
+  fire.** Some HPE firmware enforces ETag concurrency on PATCH but
+  uses 403 for "missing If-Match" instead of 412 ("If-Match did not
+  match"). Always retry with `If-Match: *` once on 403 before
+  concluding RBAC is the cause — and even when RBAC is the actual
+  cause, you want the diagnostic data to prove it rather than guess.
+- **The most common cause of UID PATCH 403 is the iLO user account
+  lacking the "Configure iLO Settings" privilege.** Login and Remote
+  Console (which are enough for reads and console launch) are not
+  enough to write IndicatorLED. Documented in TROUBLESHOOTING.md.
+- **HPE iLO 6 firmware revisions vary on which property is writable
+  for the UID LED.** Some accept `IndicatorLED` on `/Systems/1`; some
+  only on `/Chassis/1`; some have made `IndicatorLED` read-only and
+  require the DMTF newer `LocationIndicatorActive` (boolean) property.
+  v0.1.39's 6-step probe chain covers all four combinations of
+  endpoint × property to find one that works without requiring a
+  firmware-version lookup table. The trade-off: when the working
+  combination is `LocationIndicatorActive`, the badge can't
+  distinguish Lit (steady) from Blinking — both display as Lit.
+- **Always extract the Redfish error MessageId from PATCH error
+  bodies, not just the HTTP code.** Redfish's `error.@Message.ExtendedInfo[0].MessageId`
+  carries identifiers like `Base.1.0.PropertyNotWritable` that turn
+  "400 Bad Request" (useless) into "the property is read-only, try
+  the LocationIndicatorActive fallback" (immediately actionable). The
+  Morpheus HttpApiClient surfaces this via `resp.data` on non-2xx
+  responses — pull it out, even though every other 2xx response
+  treats the body as a successful payload.
+
+## 0.1.38 — Settings persistence fix + UID indicator LED control
+
+Two things: the v0.1.37 settings page rendered correctly as checkboxes but
+nothing the user saved actually took effect, and we added a long-deferred
+operational feature — front-panel UID light control from inside the tab,
+for finding a server in the datacenter.
+
+### What changed
+
+- **Fixed.** Settings persistence. v0.1.37's `readArgusSettings()` used
+  `(morpheus.getPluginConfig().toBlocking().firstOrDefault([:]) ?: [:]) as Map`,
+  which compiled fine and looked sensible, but `getPluginConfig()` returns
+  `Observable<String>` (a JSON-encoded blob), not `Observable<Map>`. The
+  `as Map` coercion against a non-empty String throws `GroovyCastException`,
+  the outer catch attempted a `metaClass.getProperty(this, 'settings')`
+  fallback that also failed, and the config Map ended up `[:]` every
+  render. Then the `isOn(null)` default of `true` made every setting
+  appear "on" regardless of what the user actually saved. Symptom: Travis
+  unchecked "Open in Popup Window", saved, Launch Console still opened a
+  popup. v0.1.38 parses the JSON properly with `JsonSlurper.parseText()`
+  and treats anything outside that successful-parse path as "use
+  defaults". The launchMode / launchWindowMode / launchAuthMethod rows in
+  the Diagnostics table flip in real time as the checkboxes toggle now,
+  making this trivially verifiable.
+
+- **New.** UID indicator LED control. The System card now always renders
+  a `UID` cell containing the current state as a colored badge
+  (Off / Lit / Blinking / Unknown — blue for active states matching the
+  physical front panel; pulse animation for Blinking) plus three small
+  action buttons (Off / Lit / Blink). Clicks navigate the iLO tab to
+  `?argusUidAction=<value>`, `renderTemplate` reads the param via the
+  Spring `RequestContextHolder` trick we already use for the CSP nonce,
+  whitelists the value against `['Off','Lit','Blinking']`, and forwards
+  it to `RedfishClient.collectStatus`. The new collectStatus signature
+  does the `PATCH /redfish/v1/Systems/1 {"IndicatorLED": value}` after
+  login but BEFORE the bulk-read, so the same render's badge reflects
+  the new state. iLO commit lag is handled with an optimistic override —
+  on successful PATCH we trust the requested value rather than the
+  subsequent GET. iLO firmware variance (Gen10 / iLO 5 expose
+  IndicatorLED on /Chassis/1 only, Gen11 / iLO 6 on /Systems/1 only) is
+  handled by falling back to /Chassis/1 if the /Systems/1 PATCH returns
+  4xx. The IndicatorLED READ also tries both endpoints in turn — that's
+  why v0.1.37's UID row never appeared on "defender" (Gen11 only reports
+  IndicatorLED on /Systems/1; v0.1.37 only read /Chassis/1). A small
+  inline success/failure line appears below the buttons on action
+  renders, then disappears on the next render. A nonce'd JS snippet
+  strips `argusUidAction` from the URL via `history.replaceState`
+  immediately on every load so a browser refresh doesn't re-fire the
+  action.
+
+- **Added.** New helper `getRequestParam(String name)` mirroring
+  `getCspNonce()` exactly — same Spring `RequestContextHolder` lookup,
+  same Groovy dynamic dispatch, same silent-failure semantics. Reads
+  query-string parameters off the current `HttpServletRequest` from
+  inside `renderTemplate`. Returns null on any failure so the UID
+  feature degrades to "no action this render" rather than throwing.
+
+- **Added.** Two new RedfishClient methods. `patchJson(path, body)` is
+  the generic PATCH wrapper, mirroring the existing `getJson(path)` GET
+  wrapper — uses the same X-Auth-Token header pattern, returns
+  `[success, errorCode?, errorMessage?]` instead of throwing.
+  `setIndicatorLed(value)` is the UID-specific helper that validates the
+  value against the whitelist, attempts /Systems/1 first, then falls
+  back to /Chassis/1, and returns the more informative of the two
+  failures when both fail.
+
+- **Added.** New diagnostic rows in the Diagnostics table:
+  `uidAction` (only present on render where an action was attempted —
+  shows the requested value and success/failure inline) and
+  `indicatorLed` (current state from the read). Useful for triaging any
+  firmware that doesn't behave like the Gen11 / Gen12 fleet.
+
+- **Bumped.** Diagnostics header to `(v0.1.38)`.
+
+### Why this design
+
+The render-time-PATCH-via-URL-param pattern was chosen over the
+alternatives discussed: a controller endpoint would need to clear the
+unresolved 403 issue from v0.1.35 first, and exposing the X-Auth-Token
+to client-side JS for a direct browser → iLO PATCH has the security
+profile of a session-hijack vulnerability waiting to happen. URL-param
+dispatch keeps the auth token server-side, requires no controller
+routing, and reuses the existing tab-render lifecycle. The browser
+back-button / refresh case is handled cleanly by `history.replaceState`
+stripping the param on load.
+
+The trade-off: clicking a UID button forces a full tab re-render
+(re-fetch of the whole Redfish status set), which is overkill for what
+should be a 100-byte PATCH. In practice it's a few hundred ms and feels
+fine; if it becomes annoying we can add a "UID-only render" fast path
+later that skips the bulk-read.
+
+### Notes
+
+The same plugin re-upload caching that bit us on v0.1.37 (where the
+OptionType registrations stayed v0.1.36 until a full uninstall+reinstall)
+applies here too. To pick up the new UID cell, do the full Admin →
+Plugins → uninstall before re-uploading the v0.1.38 JAR.
+
+## 0.1.37 — Light-mode contrast fix + settings rebuilt as checkboxes
+
+Two follow-ups from real-world v0.1.36 testing. The light-mode work in
+v0.1.36 only got us halfway there: the variable framework was right but
+the theme detection missed the actual Morpheus 9 theme class, so the
+variable stayed on dark-mode values rendering as pale gray text on white.
+Separately, the v0.1.36 settings dropdowns rendered as "No options
+available" because plugin-api 1.3.1's `optionSource` lookup expects the
+method on a registered OptionSourceProvider — not on the Plugin class
+itself.
+
+### What changed
+
+- **Fixed.** Light-mode contrast — the v0.1.36 text was still too pale to
+  read against a white background. Root cause was a two-layer miss:
+  1. The dark-mode CSS variable declarations were self-referential
+     (`--argus-bg-card: var(--argus-bg-card)`) after an over-aggressive
+     sed pass in v0.1.36 replaced the variable definitions alongside the
+     uses. Browsers ignored the recursive declarations, which is why
+     dark-mode card backgrounds went transparent (mostly invisible
+     because Morpheus's dark page bg blends through). v0.1.37 restores
+     the literal `rgba(255,255,255,0.0X)` values for dark-mode.
+  2. The light-mode CSS selectors (`body.theme-light`, `body.light-theme`,
+     `body[data-theme="light"]`, `html.theme-light`, `html.light`,
+     `.theme-light`) didn't match Morpheus 9's actual theme class, and
+     `@media (prefers-color-scheme: light)` only fires when the user's
+     OS preference matches — which doesn't track Morpheus's theme
+     setting. v0.1.37 adds a CSP-nonced inline JS snippet that reads
+     `window.getComputedStyle(document.body).backgroundColor`, computes
+     its luminance via the Rec. 709 coefficients
+     (`0.299*r + 0.587*g + 0.114*b`), and sets `data-mode="light"` or
+     `data-mode="dark"` on every `.argus-tab` element. The CSS rules
+     then switch reliably regardless of how Morpheus implements its
+     theme.
+- **Fixed.** Plugin settings showing "No options available" in v0.1.36.
+  Plugin-api 1.3.1's `optionSource: 'methodName'` lookup expects the
+  method on a registered `OptionSourceProvider`, not on the Plugin
+  class. v0.1.37 sidesteps the OptionSourceProvider registration (and
+  its own permission cascade — see the controller route history in
+  0.1.16-0.1.23) by switching from three SELECT dropdowns to three
+  CHECKBOX inputs. The behavior space is the same; the settings are
+  now:
+  - **Console: Auto-login (SSO)** — checked (default) = pre-authenticate;
+    unchecked = link-only (open `/irc.html`, user types creds at iLO).
+  - **Console: Open in Popup Window** — checked (default) = sized popup
+    (1280×800); unchecked = standard browser tab.
+  - **Console: Use Sessionkey URL Authentication** — checked (default) =
+    sessionkey URL with cookie fallback on mint failure; unchecked =
+    force the v0.1.35 cookie POST path.
+
+  The v0.1.36 "Sessionkey only — no fallback" forced mode is dropped;
+  with Auto + cookie fallback as the default, the no-fallback variant
+  added no operational value. If we need it later it becomes a fourth
+  checkbox.
+- **Strengthened.** Light-mode base text color from v0.1.36's `#1a2530`
+  to pure black (`#000000`) so the heavily-used `opacity:0.55` inline
+  styles for label text (POWER, HEALTH, iLO, etc.) still read with good
+  contrast. Added a row of attribute-substring CSS selectors that boost
+  inline opacity values in light mode via `!important` — the only way to
+  win specificity against inline `style` attributes.
+- **Bumped.** Diagnostics header to `(v0.1.37)`.
+
+### Things that didn't change
+
+- The downstream rendering path. `readArgusSettings()` still returns the
+  same `launchMode` / `windowMode` / `authMethod` keys with the same
+  string values. The CHECKBOX migration is invisible to every code path
+  that consumes the settings.
+- The v0.1.36 launch logic (sessionkey URL + cookie fallback) — that
+  side of v0.1.36 worked; only the settings UI surface was broken.
+- The NIC / HBA card split. Travis hadn't tested it against a host with
+  HBAs yet but the logic is unchanged from v0.1.36.
+
+### Notes
+
+- The JS theme detection requires the CSP nonce (read via Spring's
+  `RequestContextHolder` per 0.1.25). If the nonce is unavailable, the
+  tab silently falls back to CSS-only theme matching — works on
+  Morpheus versions whose theme class is in our list. v0.1.37's `data-
+  mode` attribute is the canonical signal; theme classes are just
+  extra coverage.
+- CHECKBOX defaults in plugin-api 1.3.1 are stringly-typed (`'on'` /
+  `'off'`) but some setups store them as Booleans. `readArgusSettings`
+  handles both via a tolerant `isOn` closure that treats anything not
+  unambiguously false-y as checked.
+- The `--argus-bg-card: var(--argus-bg-card)` self-reference bug in
+  v0.1.36 was a sed mistake — the sed pattern matched both the variable
+  USES (inline `style="background:rgba(255,255,255,0.02)"` → `var(...)`)
+  and the variable DEFINITIONS (CSS rule `--argus-bg-card:
+  rgba(255,255,255,0.02)` → `var(...)`). The fix is mechanical (restore
+  literal values in the CSS rule); the lesson is to be more surgical
+  about sed boundaries when the same substring means different things
+  in different contexts.
+
+---
+
+## 0.1.36 — Sessionkey URL launch, NIC/HBA split, light-mode theme, plugin settings
+
+Three problem reports drove this release: the tab was nearly unreadable in
+Morpheus's light theme; hosts with FC/SAS HBAs lumped them into the NIC
+Port LEDs card as confusing dark "—" entries; and the form-POST launch dance
+sometimes landed users on the iLO login page (cookie commit race) requiring
+an extra refresh.
+
+The launch fix is the headline. v0.1.35's launch posts credentials to
+`/json/login_session` then JS-schedules a navigation to `/irc.html` 1.5 s
+later, trusting iLO to commit the session cookie in time. Under load,
+sometimes it doesn't. v0.1.36 reuses the existing `RedfishClient` to mint a
+fresh session at tab render, then renders the Launch Console button as a
+plain `<a href="https://<host>/irc.html?sessionkey=<TOKEN>">`. iLO accepts
+the token via URL param, no cookie race, one click. The v0.1.35 form-POST
+path is preserved as automatic fallback for when the mint fails, and three
+new plugin settings let users tune launch / window / auth behavior.
+
+### What changed
+
+- **Fixed.** Light-mode color regression. The entire tab's color values
+  (text, card backgrounds, borders, dividers) are now driven by a single
+  set of CSS variables (`--argus-text`, `--argus-bg-card`,
+  `--argus-bg-header`, `--argus-bg-pill`, `--argus-border`,
+  `--argus-border-soft`, `--argus-bg-diag`, `--argus-btn-border`) defined
+  at the top of the render output. Dark-theme values match v0.1.35
+  exactly. Light-theme values override via multiple likely Morpheus theme
+  class patterns (`body.theme-light`, `body.light-theme`,
+  `body[data-theme="light"]`, `html.theme-light`, `html.light`,
+  `.theme-light`), plus `@media (prefers-color-scheme: light)` as a
+  last-resort fallback. Status colors (ON / WARNING / CRITICAL, link-up
+  green, etc.) are intentionally NOT variabilized — they carry semantic
+  meaning and must stay color-coded regardless of theme.
+- **Fixed.** Console launch race condition. New sessionkey-URL path:
+  `RedfishClient.acquireLaunchToken()` mints a fresh Redfish session at
+  tab render and intentionally does NOT log out — the session is
+  consumed by the user's click on the rendered `?sessionkey=<TOKEN>` URL.
+  Deterministic, no cookie commit race, single click. iLO 6 reaps the
+  session after ~30 min idle if unused, so a stale long-open tab might
+  see a login page on click — refreshing the iLO tab re-mints. The
+  legacy form-POST + setTimeout flow is kept as automatic fallback for
+  when the mint fails (firmware quirk, network blip) or when the new
+  `consoleAuthMethod` setting is set to `cookie`.
+- **Fixed.** NIC / HBA conflation. The "NIC Port LEDs" card in v0.1.35
+  rendered every port from `/Chassis/1/NetworkAdapters` regardless of
+  port technology, which surfaced FC and SAS HBA ports as dark "—"
+  entries with no Mbps speed. v0.1.36 classifies each port by
+  `ActiveLinkTechnology` (Ethernet → NIC bucket; FibreChannel /
+  InfiniBand → HBA bucket; null → fall back to adapter-model string for
+  FC / HBA / SAS / Fibre / TriMode / SmartArray markers, default NIC).
+  The card is split into **Network Adapter Ports** (Ethernet) and
+  **Host Bus Adapter Ports** (FC / SAS / IB). HBA ports use "Online /
+  Offline" semantics instead of "Link Up / Link Down" and display
+  WWPN as monospace subtext under the port label. The HBA card is
+  omitted entirely on hosts with no HBA ports, so the common case
+  (MicroServer / hyperconverged nodes) doesn't gain an empty card.
+- **Added.** Three plugin-level settings under
+  **Administration → Plugins → iLO Console → Settings**:
+  - `Console Launch Mode`: `Auto-login (SSO)` (default — matches v0.1.35)
+    or `Link only` (open `/irc.html` without auth, user types credentials
+    at iLO's prompt; useful when an org wants iLO to log the actual user
+    identity rather than a shared service account).
+  - `Console Window Mode`: `Popup` (default — 1280×800 sized window) or
+    `New tab` (standard browser tab). Popup is more ergonomic for console
+    work; tab mode is the safer choice for users with popup blockers or
+    browsers that override window-size hints by user preference.
+  - `Console Authentication Method`: `Auto` (default — try sessionkey,
+    fall back to cookie on mint failure), `Sessionkey only` (force
+    sessionkey, no fallback), or `Cookie only (legacy)` (force the
+    v0.1.35 form-POST path). Provides an explicit escape hatch for any
+    firmware quirks where one method fails consistently.
+- **Added.** iLO web UI link next to the "iLO" header. A small
+  external-link icon with the text "Open iLO UI" opens `https://<host>/`
+  in a new tab. No authentication handoff — opens iLO's login page
+  directly. Useful when users want to administer iLO settings (firmware
+  updates, user management, license) outside the Morpheus tab.
+- **Added.** WWPN capture in `RedfishClient`. Each port now records
+  `wwpn` from `port.FibreChannel?.WWPN` with fallback to
+  `port.Oem?.Hpe?.WWPN`. NIC ports keep WWPN as `null` (Ethernet doesn't
+  use WWPNs); HBA ports surface it in the new Host Bus Adapter Ports
+  card as monospace subtext for SAN admins doing zoning.
+- **Added.** Five new Diagnostics panel rows:
+  - `launchMode` — current `Console Launch Mode` setting
+  - `launchWindowMode` — current `Console Window Mode` setting
+  - `launchAuthMethod` — current `Console Authentication Method` setting
+  - `launchToken` — `minted (length=N)` or `not minted`
+  - `launchAuthResolved` — actual strategy in use this render
+    (`sessionkey` / `cookie` / `link-only` /
+    `sessionkey-failed-no-fallback`)
+
+  The existing `networkAdapters` row breaks out adapter / port count plus
+  `NIC=N, HBA=N` split (and flags ports classified via model fallback
+  rather than `ActiveLinkTechnology`) so the classifier is debuggable
+  at a glance.
+- **Added.** New docs: `docs/CREDENTIAL_TROUBLESHOOTING.md`,
+  `docs/PLUGIN_SETTINGS.md`, `docs/SCREENSHOT_GUIDE.md`. Credential doc
+  walks through every credential resolution failure mode with `curl`
+  examples (wrong ID, wrong type, cross-tenant mismatch, disabled
+  credential, labels-as-single-string visual indicator, direct iLO
+  Redfish validation). Settings doc explains each plugin setting. Screenshot
+  doc is contributor reference for capturing consistent release shots
+  with a thorough PII scrub list.
+
+### Things that didn't change
+
+- Default launch behavior. Auto-login SSO remains the default; users
+  upgrading from 0.1.35 without touching the new settings see no
+  behavioral change beyond the sessionkey URL replacing the form-POST
+  (which is invisible to the user — just more reliable).
+- Label schema. Existing hosts continue to work with `ilo-host:`,
+  `ilo-cred:`, `ilo-verify-ssl:`, `ilo-readonly:` labels unchanged.
+- Plugin internal name (`ilo-console-plugin`) and package
+  (`com.morpheusdata.iloconsole`). Renaming would break upgrade-in-place
+  compatibility; user-facing surfaces use "iLO" / "Argus" naming while
+  internal code retains `iloconsole`.
+
+### Why CSS variables rather than a wholesale rewrite
+
+The tab renders inline HTML with `style="…"` attributes — 1441 lines of
+the stuff at v0.1.35. Refactoring to external classes would be a
+multi-release effort. The CSS-variable approach is mechanical: define the
+variables once at the top of the render output, do a find-and-replace
+through the file (40+ rgba color sites), and theme-aware values fall out
+for free. Inline styles still win specificity battles, but `var(...)` in
+an inline style resolves against whichever theme is active at render
+time. No DOM detection, no `prefers-color-scheme` complexity for the
+common case — Morpheus's theme class drives it. The `prefers-color-scheme`
+media query is there only as a fallback for cases where we missed the
+real Morpheus theme class.
+
+### Why mint at tab render rather than on click
+
+A click-time mint would need a server-side endpoint to receive the click
+and respond with the sessionkey URL. The plugin abandoned registered
+controllers in v0.1.23 after 0.1.16-0.1.22 fought permission 403s
+across every documented declaration pattern with no clean resolution.
+Re-opening that question would gate v0.1.36 on solving it; minting at
+render time sidesteps the whole controller question. The cost is one
+extra Redfish session per tab view (iLO 6 default max is 10 concurrent;
+idle reap is ~30 min) and a slightly longer tab render. Acceptable for a
+non-polling UI.
+
+### Notes
+
+- Sessionkey URL has been validated against iLO 5 v2.78+ and iLO 6 v1.74.
+  Older firmware untested; users on older firmware can switch
+  `Console Authentication Method` to `Cookie only`.
+- Popup window features are honored by Chrome and Edge. Firefox may
+  ignore size hints if the user has set "open new windows in a new tab"
+  in their preferences — the link falls back to a tab gracefully in
+  that case.
+- The "labels typed as a single string" issue Travis observed during
+  v0.1.35 testing (one big pill instead of three separate ones) is user
+  error visible from the Morpheus UI's pill rendering, not a plugin bug.
+  Documented in `docs/CREDENTIAL_TROUBLESHOOTING.md` as a known failure
+  mode so first-line support can recognize it quickly.
+
+---
+
 ## 0.1.35 — Dual Celsius / Fahrenheit temperature display
 
 A small unit-display change so the plugin reads naturally for an

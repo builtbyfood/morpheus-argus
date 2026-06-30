@@ -215,12 +215,66 @@ the Drives card. iLO 6 1.60+ also moves direct-attached NVMe drives out
 of the Storage Controllers list and into Drives only — this is normal
 and the plugin handles it.
 
+> **v0.1.40 confirmation.** Field-confirmed on a Gen11 MicroServer
+> (iLO 6 v1.74, KVM hypervisor host running `amsd`): installing AMS
+> took the Drives card from empty to populating with the on-chassis
+> SATA drive details (model, capacity, health) on the next render,
+> no plugin restart required.
+
 ### Why this also happens during boot
 
 If `deviceDiscovery` in Diagnostics shows anything other than
 `vMainDeviceDiscoveryComplete`, iLO is still discovering hardware
 (usually during/just after POST). A yellow info banner appears in the
 tab in this case. Wait a minute and refresh.
+
+---
+
+## `hpilo` kernel log noise after AMS install
+
+After installing AMS, the host's kernel log (`dmesg`, `journalctl -k`)
+fills with messages like:
+
+```
+[123456.7890] hpilo 0000:02:00.2: Open could not dequeue a packet
+[123456.7891] hpilo 0000:02:00.2: Open could not dequeue a packet
+[123456.7892] hpilo 0000:02:00.2: Closing, but controller still active
+```
+
+**This is normal operational noise from the HPE CHIF (Channel Interface)
+driver, not a fault.** The `hpilo` kernel driver provides the userspace
+channel that AMS uses to talk to iLO over PCIe. The "could not dequeue
+a packet" warnings happen when AMS opens a channel slot, polls for
+data, and finds none waiting yet — which is common during normal AMS
+operation. The "Closing, but controller still active" message happens
+when AMS closes a channel slot while iLO still has the corresponding
+mailbox flagged as active.
+
+These messages do **not** indicate:
+- An iLO failure or instability
+- A driver bug
+- A plugin malfunction (the plugin talks Redfish over the network, not
+  through `hpilo` — these messages happen whether or not the plugin
+  is installed)
+- A reason to remove or stop AMS
+
+If the volume of messages is operationally annoying, you can filter
+them out at the rsyslog or journald level:
+
+```
+# Filter hpilo messages from rsyslog
+:msg, contains, "hpilo" stop
+```
+
+Or rate-limit them in dmesg:
+```
+echo 'kernel.printk_ratelimit = 5' >> /etc/sysctl.d/99-hpilo-quiet.conf
+sysctl -p /etc/sysctl.d/99-hpilo-quiet.conf
+```
+
+Filing a bug with HPE about the warning verbosity is the long-term
+path; the messages serve no operational purpose and the driver could
+demote them to debug level.
 
 ---
 
@@ -269,6 +323,269 @@ base `Status.Health`, and finally uses `LinkStatus` for green/gray.
 If every dot is gray, the most likely cause is that all ports are
 `LinkDown` and have no health field populated. Confirm in the Network
 Adapters card above — the per-port table shows the same data.
+
+## UID cell shows "Unknown" or buttons don't do anything (v0.1.38+)
+
+The plugin reads `IndicatorLED` from `/Chassis/1` first, then falls
+back to `/Systems/1`. If both come back null, the cell shows "Unknown".
+This is rare — every iLO 5 / iLO 6 / iLO 7 firmware we've seen
+populates one or both. If it persists, check the Diagnostics row
+`indicatorLed` at the bottom of the tab; if that row is missing entirely
+the read failed at the HTTP layer (auth or network issue).
+
+If the buttons render but clicking them does nothing — no URL change,
+no badge change — the CSP nonce is missing. The same nonce drives
+theme detection and console launch, so check the Diagnostics row
+`cspNonce` — if it reads `missing`, no JS runs in the tab, including
+UID. This is the same condition that disables one-click console
+launch; see "One-click flow doesn't work" above.
+
+The action only fires for the exact values `Off`, `Lit`, `Blinking`
+(case-sensitive). The buttons emit those values directly; if you
+construct a `?argusUidAction=` URL by hand with a different value
+it is ignored silently — no PATCH, no diagnostic row.
+
+## UID change failed: iLO returned 400 PropertyNotWritableOrUnknown intermittently
+
+This symptom looks identical to the firmware-property-readonly case from
+v0.1.40 but is actually a transient session-pressure failure when other
+clients (web UI tabs, open IRC console windows, ongoing REST API
+clients) are holding iLO sessions.
+
+iLO 6 typically caps concurrent sessions at around 13 across **all**
+clients. The plugin opens an iLO session on every tab render to mint
+the sessionkey for console launch, and every Launch Console click
+opens another short-lived session that doesn't close until the IRC
+window does. A normal operator workflow (open the iLO tab a few times,
+launch console once or twice, leave a console window open while you
+work, then come back to the tab) can stack 6-10 sessions easily.
+
+Once the pool saturates, iLO refuses NEW operations with confusing
+errors. PATCH operations (UID writes, BIOS settings, anything mutable)
+fail first. Reads continue to succeed, so the symptom looks code-
+related rather than session-related: the tab renders fine, but
+clicking UID buttons returns the misleading
+`iLO.2.37.PropertyNotWritableOrUnknown` error on every probe step.
+
+### How to confirm session pressure is the cause
+
+Open the **Diagnostics** block and look for the `iloSessions` row
+(v0.1.41+). It shows the current concurrent session count. v0.1.41
+color-codes it:
+
+- `< 7` sessions → black/normal, no concern.
+- `7-10` sessions → yellow, approaching the cap.
+- `≥ 11` sessions → red, at or near the cap. The inline hint reads:
+  *"at or near iLO's ~13-session cap; close stale console windows
+  before chasing UID PATCH errors."*
+
+If `iloSessions` reads ≥ 11 and your UID PATCH is failing with
+`PropertyNotWritableOrUnknown`, you've found the cause.
+
+### How to recover
+
+1. Close any IRC console windows you have open in your browser. Each
+   one holds an iLO session for the duration of the window's lifetime.
+2. Close any iLO web UI tabs.
+3. In iLO web UI: navigate to **Administration → Active Sessions** and
+   manually disconnect any stale sessions.
+4. Wait. iLO times out idle sessions after ~30 minutes by default; the
+   pool will recover on its own if you stop adding to it.
+
+Refresh the Morpheus iLO tab. `iloSessions` should drop. UID PATCH
+should start working again.
+
+### Why this is so confusing
+
+The error message iLO returns —
+`iLO.2.37.PropertyNotWritableOrUnknown` — is genuinely misleading.
+"Unknown" suggests the property doesn't exist, not that the system is
+under session pressure. HPE could fix this by returning a 503 Service
+Unavailable with a session-pressure-specific MessageId, but the
+current behavior dates back to early iLO firmware. The
+`iloSessions` row is the cheapest way to tell the difference without
+filing a ticket with HPE.
+
+### Long-term plugin behavior
+
+The plugin currently opens a session per tab render and lets iLO
+reap idle sessions. A future version could explicitly delete the
+session at the end of each render (we have `sessionLocation` saved
+and a logout path in `RedfishClient`), trading slight latency on
+each render for never contributing to session pressure. Filed as a
+to-do; happy to accept PRs for it.
+
+## UID change failed: iLO returned 403 / 401 / 400 / 404 / 405 (v0.1.40+)
+
+The plugin walks an 8-step PATCH probe chain when you click a UID button:
+
+1. `PATCH /redfish/v1/Systems/1 {IndicatorLED}` with no `If-Match`.
+2. Same, but with `If-Match: *` (rules out firmware that returns 403
+   instead of the spec-correct 412 for missing-ETag concurrency).
+3. `PATCH /redfish/v1/Chassis/1 {IndicatorLED}` with no `If-Match`.
+4. Same, but with `If-Match: *`.
+5. `PATCH /redfish/v1/Systems/1 {LocationIndicatorActive: bool}` — DMTF's
+   newer boolean replacement for IndicatorLED. Off → `false`, Lit/Blinking
+   → `true`.
+6. `PATCH /redfish/v1/Chassis/1 {LocationIndicatorActive: bool}`.
+7. `PATCH /redfish/v1/Systems/1 {Oem: {Hpe: {IndicatorLED: value}}}` —
+   HPE OEM nested property. HPE's iLO 6 changelog calls this out
+   explicitly as the writable fallback for clients that want to keep
+   using Lit/Blinking/Off rather than the boolean LocationIndicatorActive.
+   On modern iLO 6 firmware (1.5+) where the DMTF properties are
+   read-only, this is the one that actually works.
+8. `PATCH /redfish/v1/Chassis/1 {Oem: {Hpe: {IndicatorLED: value}}}`.
+
+If any step succeeds, you see the green check banner with the property
+name that worked, like `UID set to Lit (success via Oem.Hpe.IndicatorLED)`.
+If all eight fail, the inline banner names the most likely cause based on
+the HTTP code and (for 400) the Redfish MessageId from iLO's response
+body. The per-step outcome lives in the Diagnostics row
+`uidActionAttempts`, which looks like:
+
+```
+/Systems/1: HTTP 400 iLO.2.37.PropertyNotWritableOrUnknown ·
+/Systems/1 +ETag: HTTP 400 iLO.2.37.PropertyNotWritableOrUnknown ·
+/Chassis/1: HTTP 400 iLO.2.37.PropertyNotWritableOrUnknown ·
+/Chassis/1 +ETag: HTTP 400 iLO.2.37.PropertyNotWritableOrUnknown ·
+/Systems/1 LIA: HTTP 400 iLO.2.37.PropertyNotWritableOrUnknown ·
+/Chassis/1 LIA: HTTP 400 iLO.2.37.PropertyNotWritableOrUnknown ·
+/Systems/1 OEM: ok
+```
+
+That format tells you both *which paths failed and how* and *which path
+finally worked*. The `LIA` and `OEM` tags mark which property the
+attempt used (DMTF IndicatorLED is unlabeled because it's the default).
+
+**All eight returned 403.** Almost always RBAC — the iLO user account
+lacks the privilege to write `IndicatorLED`. See *iLO user privileges
+required for write operations* below.
+
+**All eight returned 401.** The X-Auth-Token expired between login and
+PATCH. We've only seen this when another admin session was active on
+iLO and the plugin's session got bumped.
+
+**All eight returned 400 with `PropertyNotWritable`, `PropertyReadOnly`,
+or `iLO.*.PropertyNotWritableOrUnknown` (HPE's variant).** Every
+writable UID property we know about — `IndicatorLED`,
+`LocationIndicatorActive`, and `Oem.Hpe.IndicatorLED` — is read-only
+on this firmware/hardware combination. This shouldn't happen on
+supported iLO firmware; file a GitHub issue with the iLO version
+string from the Diagnostics row `iloFirmware` and the full
+`uidActionAttempts` row so we can hunt for whatever new OEM action
+HPE may have introduced.
+
+**All eight returned 400 with `PropertyValueNotInList`,
+`PropertyValueNotInAllowableValues`, or `PropertyValueTypeError`.** The
+value you sent isn't in the firmware's allowed list. Some firmware
+supports only `Off` and `Blinking` (no `Lit` steady state). Try a
+different button.
+
+**All eight returned 404.** None of the three properties is exposed on
+this firmware/hardware combination. File a GitHub issue.
+
+**All eight returned 405.** PATCH method not allowed. Likely a firmware
+quirk. Workaround: click "Open iLO UI" in the header card and set UID
+from iLO's own UI.
+
+**Mixed codes across the eight attempts.** Usually means firmware quirks
+rather than RBAC. Capture the exact `uidActionAttempts` row and file
+an issue.
+
+**Steps 1-6 fail but step 7 or 8 succeeds.** This is the expected path
+on iLO 6 v1.5+ firmware that has made DMTF IndicatorLED read-only AND
+also locks down LocationIndicatorActive. HPE moved the writable bit
+to `Oem.Hpe.IndicatorLED` explicitly as a Lit/Blinking/Off fallback.
+Everything works correctly; the OEM property round-trips faithfully
+(Lit and Blinking are distinguishable, unlike the LocationIndicatorActive
+boolean fallback).
+
+**Steps 1-4 fail but step 5 or 6 succeeds.** Older firmware path where
+DMTF IndicatorLED is deprecated and LocationIndicatorActive is the
+writable property. Caveat: the badge will read `Lit` for any "on"
+state (boolean can't distinguish Lit from Blinking), and the diagnostics
+row `indicatorLed` will append `(via LocationIndicatorActive)`.
+
+## Plugin settings checkboxes appear to do nothing (v0.1.40+)
+
+Symptom: unchecking "Console: Open in Popup Window" still opens a
+popup; unchecking "Console: Auto-login (SSO)" still pre-authenticates.
+Same for the third checkbox. v0.1.40 added diagnostics rows so you can
+see what's actually going on without source access to Morpheus's form
+handler.
+
+Open the **Diagnostics** block at the bottom of the tab and look for
+five rows:
+
+- `launchMode`, `launchWindowMode`, `launchAuthMethod` — what the
+  plugin ultimately decided after reading + interpreting the saved
+  settings.
+- `settingsParsedKeys` — list of keys present in the JSON Morpheus
+  persisted, plus a `hasKeys=yes/no` boolean. `hasKeys=no` means
+  Morpheus is returning an empty config blob (you've never saved, or
+  Morpheus dropped it somehow).
+- `settingsRaw` — each individual setting's raw value as Morpheus
+  stored it: `autoLogin=on · popup=<null> · sessionkey=on`. `<null>`
+  means the field is entirely absent from the JSON (Morpheus dropped
+  it when you unchecked); a value like `on` or `off` is the literal
+  string Morpheus persisted.
+- `settingsJson` — the raw JSON Morpheus returned from
+  `getPluginConfig()`, truncated to ~400 chars.
+
+### Three possible diagnoses, by `settingsRaw` row content
+
+**Unchecked field shows as `<null>` in `settingsRaw`.** Morpheus is
+dropping unchecked CHECKBOX fields from the persisted JSON. v0.1.40's
+defensive `isOn()` should handle this correctly — when other keys are
+present (`hasKeys=yes`), missing keys are treated as `false`. If
+you're seeing this AND the corresponding `launchMode` /
+`launchWindowMode` / `launchAuthMethod` row still reads the "on"
+value, file a GitHub issue with the full diagnostics block.
+
+**Unchecked field shows as `off`, `false`, `0`, or empty string.**
+Morpheus is persisting the unchecked state explicitly. The defensive
+`isOn()` should handle this. If the resolved row (`launchMode` etc.)
+still reads the "on" value, file a GitHub issue.
+
+**Unchecked field shows as `on` regardless of UI state.** This is the
+nasty case: Morpheus is persisting the OptionType's `defaultValue` on
+form submit regardless of UI checkbox state. The plugin can't tell
+this apart from the user genuinely leaving the box checked, and there's
+no plugin-side fix that doesn't break the fresh-install UX of
+"defaults are sensible without visiting Settings". File a Morpheus
+issue with the diagnostics row attached.
+
+In all three cases the diagnostics row is the source of truth. Don't
+guess what's saved — read it.
+
+## iLO user privileges
+
+The plugin reads a lot from iLO and writes very little. In practice, an
+iLO user account with just **Login** and **Remote Console** privileges
+has been sufficient for every plugin feature in field testing — reads,
+console launch (sessionkey-pre-authenticated), AND UID indicator LED
+control via `LocationIndicatorActive` and `Oem.Hpe.IndicatorLED`. You
+don't necessarily need to grant additional write privileges for UID
+control specifically; both DMTF's newer boolean property and HPE's
+OEM property route around the older `Configure iLO Settings`
+requirement that the deprecated top-level `IndicatorLED` had.
+
+If UID PATCH fails with HTTP 403 on every probe step, RBAC is one
+possible cause but not the only one — concurrent session pressure on
+iLO (see *UID change failed intermittently* above) more commonly
+produces this symptom than missing privileges. Verify the session
+count in the `iloSessions` diagnostic row first; if it's near or over
+13, close stale console windows and retry before touching iLO user
+privileges.
+
+If UID PATCH genuinely returns 403 after sessions have been cleared
+and a retry, the iLO user may need a higher privilege level — HPE's
+RBAC is firmware-version-specific and not consistently documented.
+Try escalating the iLO user to administrator temporarily as a
+diagnostic; if writes succeed, you can narrow down which specific
+privilege is needed by re-removing them one at a time. The plugin
+itself makes no specific privilege demand beyond Login + Remote
+Console for everything that currently works.
 
 ## Volumes / RAID card is missing
 

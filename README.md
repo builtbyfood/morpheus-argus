@@ -21,7 +21,7 @@ one click.
 | Internal Morpheus plugin code (`getCode()`) | `morpheus-ilo-console` | Unchanged from earlier versions so installed plugins upgrade cleanly without needing an uninstall/reinstall. |
 | Java package | `com.morpheusdata.iloconsole` | Same reason — class identity preserved. |
 
-If you build the source, the JAR comes out as `morpheus-argus-0.x.x-all.jar`.
+If you build the source, the JAR comes out as `morpheus-argus-0.1.x-all.jar`.
 
 ---
 
@@ -30,37 +30,41 @@ If you build the source, the JAR comes out as `morpheus-argus-0.x.x-all.jar`.
 | Surface | Where |
 | --- | --- |
 | **iLO** tab | Infrastructure → Compute → Hosts → *any HPE ProLiant host* |
-| **System** card | Power state · Health · iLO model + firmware · BIOS version · CPU · Memory · Serial · Asset Tag · SKU · **Indicator LED** state · **TPM** · **Boot Progress** · **Boot Override** · **Hostname** |
-| **Power & Cooling** card | Current power draw (with average fallback) · PSU count + redundancy · hottest CPU temperature · ambient temperature · fan summary. Temperatures shown as °C / °F. |
+| **System** card | Power state · Health · iLO model + firmware · BIOS version · CPU · Memory · Serial · Asset Tag · SKU · **UID indicator LED** state + Off / Lit / Blink control buttons · **TPM** · **Boot Progress** · **Boot Override** · **Hostname** |
+| **Power & Cooling** card | Current power draw (with average fallback) · PSU count + redundancy · hottest CPU temperature · ambient temperature · fan summary. Temperatures shown as °C / °F (zero-config, international-friendly). |
 | **Network** card | Host MAC + IP + link status · iLO's own MAC + IP + hostname/FQDN · **iLO date/time** · **iLO license type** |
-| **Drives** card | Per-drive model · media type · protocol · capacity · health (with ⚠ on predicted failure). |
+| **Drives** card | Per-drive model · media type · protocol · capacity · health (with ⚠ on predicted failure). Requires HPE AMS agent on the host OS for chipset-SATA drive enumeration. |
 | **Power Trend** card | Inline SVG sparkline of historical power draw from `/Power/PowerMeter` + current/min/avg/max gauge from `/EnvironmentMetrics`. Gracefully empty on hardware that doesn't track power. |
 | **Network Adapters** (collapsible) | Per-adapter model · manufacturer · serial · firmware · health. Per-port table with link state · speed · MAC. |
 | **NIC Port LEDs** card | At-a-glance colored dot per port: green LinkUp · gray LinkDown · yellow Warning · red Critical. Native hover tooltip with adapter + MAC. |
 | **Volumes / RAID** card | Per-volume RAID type · capacity · drive count · health · in-progress operation (rebuild / init pct) · encryption · boot-volume star. Skipped when no RAID controller present. |
 | **DIMMs** (collapsible) | Per-slot capacity · speed · type · manufacturer · part number. |
+| **Cooling Zones** (collapsible) | All temperature sensors with reading / warning / critical thresholds in °C / °F. |
+| **Firmware Inventory** (collapsible) | Components iLO reports as updateable plus their installed firmware versions. |
 | **Active iLO Sessions** (collapsible) | Other users currently logged into this iLO (useful before launching IRC). |
 | **Recent Events** (collapsible) | Last 5 IML entries with severity coloring |
-| **▶ Launch Console** button | Posts iLO credentials, opens the IRC console pre-authenticated. One click when CSP nonce is available; two clicks otherwise. |
+| **▶ Launch Console** button | Sessionkey-pre-authenticated one-click launch to IRC HTML5 console. Configurable popup vs tab via plugin settings. |
 | **→ Open Console** button | Manual companion to Launch — navigates the popup to `/irc.html`. |
+| **Open iLO UI** link | Opens iLO's own web UI in a new tab when full iLO administration is needed. |
 | **Show credentials** toggle | CSS-only reveal of the configured username + password, single-click select for paste. |
 | **Read-only mode** (label-driven) | When `ilo-readonly:true` is set on a host, hides credentials and launch UI entirely; status cards still render. |
-| **Diagnostics** (collapsible) | Property-access trace, label values, CSP nonce status, readonly state. |
+| **Diagnostics** (collapsible) | Property-access trace, label values, CSP nonce status, readonly state, **plugin settings forensics**, **iLO concurrent-session count** (color-coded near-cap warning), UID PATCH attempt trace. |
 
 Tested against:
 
-- Morpheus 9.0.0 / plugin-api 1.3.1
-- HPE ProLiant MicroServer Gen11, iLO 6 v1.74
+- Morpheus 9.0.0 / plugin-api 1.3.1 (RxJava 3 runtime)
+- HPE ProLiant MicroServer Gen10 Plus (iLO 5) and Gen11 (iLO 6 v1.74)
+- HPE ProLiant Compute DL325 Gen12 (iLO 7 v1.22.00)
 - Chrome 130+, Firefox 130+, Brave 1.70+
 
 ---
 
-## Install by building or using the presented JAR file located here: https://github.com/builtbyfood/morpheus-argus/releases
+## Install
 
 1. **Build** the JAR locally:
    ```bash
    ./gradlew clean shadowJar
-   # output: build/libs/morpheus-argus-0.1.35-all.jar
+   # output: build/libs/morpheus-argus-0.1.43-all.jar
    ```
    Requires JDK 17 (produces Java 11 bytecode).
 
@@ -74,7 +78,7 @@ Tested against:
    ```
    You should see:
    ```
-   INFO  c.m.i.IloConsolePlugin - iLO Console plugin 0.1.35 initialized
+   INFO  c.m.i.IloConsolePlugin - iLO Console plugin 0.1.43 initialized
                                   (custom HandlebarsRenderer, no controller routes)
    ```
 
@@ -85,7 +89,10 @@ Tested against:
 
 5. **Upgrading from an earlier version**: do a full uninstall first
    (**Plugins → iLO Console → Uninstall**), then upload the new JAR.
-   Morpheus's plugin hot-replace can be flaky and leave stale state.
+   Morpheus's plugin hot-replace can be flaky and leave stale state —
+   in particular OptionType registrations and plugin metadata get
+   cached, so unchecked settings won't take effect if you upload over
+   an older version in place.
 
 ---
 
@@ -111,20 +118,52 @@ name, and check the URL or page title — there's a numeric `id` field.
 The plugin's Diagnostics block also shows `credSource` once a
 credential has been loaded, which can confirm you've got the right one.
 
+For deeper credential-resolution troubleshooting, see
+[`docs/CREDENTIAL_TROUBLESHOOTING.md`](docs/CREDENTIAL_TROUBLESHOOTING.md).
+
+---
+
+## Plugin Settings (v0.1.36+)
+
+Three plugin-level settings under
+**Administration → Plugins → iLO Console → Settings** control runtime
+launch behavior. All three are plugin-wide (not per-host) so per-host
+config stays label-driven and scriptable. Defaults preserve v0.1.35
+user-visible behavior — upgrading without touching settings is invisible.
+
+> **v0.1.37 changed the UI from SELECT dropdowns to CHECKBOXES** because
+> v0.1.36's `optionSource` lookup pattern didn't work in plugin-api
+> 1.3.1 (the dropdowns rendered "No options available"). Behavior space
+> is identical; only the input style changed.
+
+| Setting (checkbox) | Default | When checked | When unchecked |
+| --- | --- | --- | --- |
+| **Console: Auto-login (SSO)** | ✓ | Pre-authenticate iLO session, one-click pre-authed console | Open `/irc.html` without auth, user types credentials at iLO |
+| **Console: Open in Popup Window** | ✓ | Sized popup window (1280×800) | Standard browser tab |
+| **Console: Use Sessionkey URL Authentication** | ✓ | Sessionkey URL launch (deterministic, no cookie race), falls back to cookie POST on mint failure | Force the v0.1.35 cookie POST path |
+
+Unchecking **Use Sessionkey URL Authentication** is the explicit escape
+hatch if a firmware quirk turns up where the sessionkey URL path doesn't
+work — drops back to the v0.1.35 form-POST flow without downgrading the
+plugin.
+
+Full reference in [`docs/PLUGIN_SETTINGS.md`](docs/PLUGIN_SETTINGS.md).
+
 ---
 
 ## Using the tab
 
 ### Buttons at a glance
 
-The header row has three buttons. Each one also has a hover tooltip
+The header row has these buttons. Each one also has a hover tooltip
 explaining what it does, in case you forget:
 
 | Button | What it does |
 | --- | --- |
+| **Open iLO UI** (link in header, v0.1.36) | Opens `https://<iloHost>/` in a new tab. No authentication handoff — iLO presents its login page. Useful when you want to administer iLO settings (firmware updates, user management, license) outside the Morpheus tab. |
 | **Show credentials** | Reveals the configured iLO username and password in a panel below the header, for manual copy/paste. Pure HTML/CSS — nothing is transmitted anywhere by clicking this. Single-click any value to select the whole string for Ctrl+C. |
-| **▶ Launch Console** | Auto-logs into iLO with the stored credentials, then opens the IRC console pre-authenticated in a new window. **One click does both steps.** Used when you want to go from Morpheus to an active iLO console in the fastest possible way. |
-| **→ Open Console** | Opens the IRC console using the existing iLO session cookie that Launch Console established. Use this if the auto-navigate in Launch Console didn't complete (you see iLO's JSON response and nothing else), or to re-open the console in the same popup window later without re-authenticating. |
+| **▶ Launch Console** | Opens the IRC console pre-authenticated in a new window. **One click does both authentication and console open.** Used when you want to go from Morpheus to an active iLO console in the fastest possible way. v0.1.36+ uses a sessionkey URL by default (deterministic — no cookie commit race); falls back to the v0.1.35 form-POST path automatically when needed. Set `Console Launch Mode` to `Link only` to skip authentication and let iLO log the actual user. |
+| **→ Open Console** | Opens the IRC console using the existing iLO session cookie that Launch Console established. Use this if the auto-navigate in Launch Console didn't complete, or to re-open the console in the same popup window later without re-authenticating. |
 
 ### Status panel
 
@@ -279,11 +318,6 @@ Not yet implemented, in priority order:
    plugin option-type form.
 3. **Multi-iLO inventory view** — a separate dashboard provider that
    lists all iLO-managed hosts with summary status.
-4. **Indicator LED toggle** — single button in the System card to flip
-   the chassis identifier LED on/off. (Not power control per se, but
-   uses the same `PATCH /Chassis/1` mechanism that power actions would.
-   Useful when you're physically in the rack identifying a specific
-   server.)
 
 ---
 
@@ -311,7 +345,7 @@ Not yet implemented, in priority order:
 git clone https://github.com/builtbyfood/morpheus-argus.git
 cd morpheus-argus
 ./gradlew clean shadowJar
-# output: build/libs/morpheus-argus-0.1.35-all.jar
+# output: build/libs/morpheus-argus-0.1.37-all.jar
 ```
 
 JDK 17 required (produces Java 11 bytecode for plugin-api 1.3.1 / Morpheus 9.0).
@@ -323,6 +357,9 @@ Project layout:
 - `docs/ARCHITECTURE.md` — design rationale
 - `docs/CHANGELOG.md` — version history
 - `docs/TROUBLESHOOTING.md` — symptom-driven troubleshooting
+- `docs/CREDENTIAL_TROUBLESHOOTING.md` — credential resolution failure walkthrough (v0.1.36+)
+- `docs/PLUGIN_SETTINGS.md` — plugin settings reference (v0.1.36+)
+- `docs/SCREENSHOT_GUIDE.md` — release screenshot capture + PII scrub list (v0.1.36+)
 
 ---
 

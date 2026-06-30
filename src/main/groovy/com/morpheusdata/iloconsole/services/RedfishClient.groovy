@@ -78,6 +78,45 @@ class RedfishClient {
         }
     }
 
+    /**
+     * v0.1.36 — Get the current X-Auth-Token without logging out. Used by
+     * the sessionkey-URL launch path: the tab renders a link like
+     *   https://&lt;iloHost&gt;/irc.html?sessionkey=&lt;TOKEN&gt;
+     * which iLO accepts deterministically (no cookie commit race). The
+     * caller is responsible for NOT calling logout() on this client
+     * afterward — the session is intended for the user to consume via
+     * the rendered link. iLO will reap it after its idle TTL if unused.
+     */
+    String getAuthToken() {
+        return authToken
+    }
+
+    /**
+     * v0.1.36 — Mint a fresh Redfish session and return the token, leaving
+     * the session live. Used at tab render time to power the sessionkey
+     * URL launch button. Returns null on any failure so the caller can
+     * fall back to the legacy form-POST flow without exception handling.
+     *
+     * NOTE: this leaks a session per tab render. iLO 6 default max sessions
+     * is generous (typically 10) and idle sessions are reaped after ~30 min,
+     * so this is fine for the design — but don't call it from a polling loop.
+     */
+    static String acquireLaunchToken(String iloHost, boolean verifySsl, String username, String password) {
+        if (!iloHost || !username || password == null) return null
+        try {
+            RedfishClient client = new RedfishClient(iloHost, verifySsl)
+            client.login(username, password)
+            String token = client.authToken
+            // Intentionally do NOT call client.logout() — we want the session
+            // to outlive this method so the user's click on the launch URL
+            // arrives at a still-valid sessionkey.
+            return token
+        } catch (Throwable t) {
+            log.warn("iLO ${iloHost}: acquireLaunchToken failed: ${t.message}")
+            return null
+        }
+    }
+
     /** GET a Redfish path. Returns parsed JSON Map/List, or null on error. */
     Object getJson(String path) {
         if (!authToken) throw new IllegalStateException("not logged in")
@@ -94,14 +133,332 @@ class RedfishClient {
     }
 
     /**
+     * v0.1.38 — PATCH a Redfish path with a JSON body. Returns a small
+     * result Map: [success: boolean, errorCode: int?, errorMessage: String?].
+     * Used by the UID indicator LED control: a PATCH to /Systems/1 with
+     * {"IndicatorLED":"Blinking"} (or "Lit"/"Off") flips the front-panel
+     * UID light so a datacenter tech can find the box.
+     *
+     * Designed to never throw on caller side — every failure mode collapses
+     * into success=false with an errorMessage suitable for surfacing in
+     * the rendered tab. We do NOT swallow exceptions inside callJsonApi
+     * itself; that path is already defensive in the Morpheus HTTP client.
+     *
+     * v0.1.39 — `extraHeaders` lets callers add per-call headers (e.g.
+     * `If-Match: *` to satisfy strict Redfish servers that require ETag
+     * concurrency on PATCH). null/empty maps preserve v0.1.38 behavior.
+     */
+    Map patchJson(String path, Map body, Map<String, String> extraHeaders = null) {
+        if (!authToken) {
+            return [success: false, errorMessage: 'not logged in']
+        }
+        try {
+            // Base headers — same set as v0.1.38. Caller-supplied extras
+            // are merged on top so a clashing key wins from the caller.
+            Map<String, String> headers = [
+                    'X-Auth-Token': authToken,
+                    'Content-Type': 'application/json',
+                    'Accept'      : 'application/json'
+            ]
+            if (extraHeaders) headers.putAll(extraHeaders)
+            HttpApiClient.RequestOptions opts = new HttpApiClient.RequestOptions(
+                    headers    : headers,
+                    body       : JsonOutput.toJson(body),
+                    contentType: 'application/json',
+                    ignoreSSL  : !verifySsl
+            )
+            def resp = http.callJsonApi(baseUrl(), path, opts, 'PATCH')
+            if (resp == null) {
+                return [success: false, errorMessage: 'null response from PATCH']
+            }
+            if (!resp.success) {
+                // v0.1.39 — Pull the Redfish error MessageId out of the
+                // response body when iLO returns one. Standard Redfish
+                // error shape is:
+                //   { "error": {
+                //       "code": "Base.1.0.GeneralError",
+                //       "message": "A general error has occurred...",
+                //       "@Message.ExtendedInfo": [
+                //         { "MessageId": "Base.1.0.PropertyNotWritable",
+                //           "Message": "The property IndicatorLED is..." }
+                //       ]
+                //     }
+                //   }
+                // Extracting the MessageId is what turns "iLO returned 400"
+                // (useless) into "iLO returned 400 (PropertyNotWritable)"
+                // (immediately actionable — try a different property name).
+                String redfishMsgId = null
+                String redfishMsg   = null
+                try {
+                    def errData = resp.data
+                    if (errData instanceof Map) {
+                        def err = errData.error
+                        if (err instanceof Map) {
+                            def extInfo = err['@Message.ExtendedInfo']
+                            if (extInfo instanceof List && extInfo.size() > 0) {
+                                def first = extInfo[0]
+                                if (first instanceof Map) {
+                                    redfishMsgId = first.MessageId as String
+                                    redfishMsg   = first.Message as String
+                                }
+                            }
+                            if (!redfishMsg) redfishMsg = err.message as String
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // Body wasn't parseable Redfish error JSON — leave
+                    // redfishMsgId null and let the HTTP code stand alone.
+                }
+                String baseMsg = resp.errorCode ? "iLO returned ${resp.errorCode}" : 'PATCH failed'
+                String enriched = redfishMsgId ? "${baseMsg} (${redfishMsgId})" : baseMsg
+                return [success         : false,
+                        errorCode       : resp.errorCode,
+                        errorMessage    : enriched,
+                        redfishMessageId: redfishMsgId,
+                        redfishMessage  : redfishMsg]
+            }
+            return [success: true]
+        } catch (Throwable t) {
+            log.warn("iLO ${iloHost} PATCH ${path} threw: ${t.message}")
+            return [success: false, errorMessage: t.message ?: t.class.simpleName]
+        }
+    }
+
+    /**
+     * v0.1.38 — Set the front-panel UID indicator LED. Tries the
+     * Systems/1 endpoint first (where HPE iLO 6/7 accepts PATCH on most
+     * firmware versions) and falls back to Chassis/1 on 4xx — some
+     * older iLO firmware exposes the IndicatorLED property on Chassis/1
+     * only. `value` must be one of: 'Off', 'Lit', 'Blinking'.
+     *
+     * Returns the same [success, errorMessage] shape as patchJson so
+     * callers can render a single inline banner from the result.
+     *
+     * v0.1.39 — extended to a six-step probe chain to rule out the three
+     * non-RBAC failure modes we've seen in real environments:
+     *
+     *   1. PATCH /Systems/1 {IndicatorLED} — plain (v0.1.38 behavior).
+     *   2. PATCH /Systems/1 {IndicatorLED} + `If-Match: *` — for iLO
+     *      firmware that requires ETag concurrency on PATCH and rejects
+     *      missing-If-Match as 403 (rather than the spec-correct 412).
+     *   3. PATCH /Chassis/1 {IndicatorLED} — plain (v0.1.38 fallback).
+     *   4. PATCH /Chassis/1 {IndicatorLED} + `If-Match: *`.
+     *   5. PATCH /Systems/1 {LocationIndicatorActive} — DMTF's newer
+     *      boolean replacement. iLO 6 1.5+/iLO 7 firmware has been
+     *      observed to make IndicatorLED read-only and only accept
+     *      writes via this property. Mapping: 'Off' → false, anything
+     *      else → true. Loses Lit-vs-Blinking distinction.
+     *   6. PATCH /Chassis/1 {LocationIndicatorActive}.
+     *
+     * v0.1.40 — extended further with two HPE OEM probe steps after
+     * field reports of iLO 6 v1.74 returning iLO.2.37.PropertyNotWritableOrUnknown
+     * on both DMTF properties. From HPE's iLO 6 changelog:
+     *   "Added Oem.Hpe.IndicatorLED: ... This is a fallback added for
+     *    clients that want to continue to use IndicatorLED."
+     * In other words, on this firmware DMTF IndicatorLED is read-only,
+     * LocationIndicatorActive also rejects writes, and HPE moved the
+     * writable Lit/Blinking/Off property to Oem.Hpe.IndicatorLED. The
+     * body shape is the standard nested-OEM form:
+     *
+     *   7. PATCH /Systems/1 {Oem: {Hpe: {IndicatorLED: value}}}.
+     *   8. PATCH /Chassis/1 {Oem: {Hpe: {IndicatorLED: value}}}.
+     *
+     * The result Map carries an `attempts` list with each step's path,
+     * If-Match flag, property name used, HTTP code, and Redfish
+     * MessageId so the diagnostics row can show exactly what was tried
+     * and why each step failed. The aggregate `errorMessage` carries a
+     * tailored hint based on the dominant HTTP code and (for 400)
+     * MessageId:
+     *
+     *   - 401 → "iLO session token expired" (rare; concurrent admin
+     *     sessions).
+     *   - 403 → "iLO returned 403 on all attempts — the iLO user
+     *     account likely lacks 'Configure iLO Settings' privilege.
+     *     See TROUBLESHOOTING.md → iLO user privileges."
+     *   - 400 + PropertyNotWritable / iLO.*.PropertyNotWritableOrUnknown
+     *     across ALL 8 attempts → "Property is genuinely unavailable
+     *     for write on this hardware. File an issue."
+     *   - 400 + PropertyValueNotInList → "The value '<value>' isn't
+     *     accepted by this firmware. Some iLO 6 firmware supports only
+     *     Off/Blinking — try a different button."
+     *   - 404 → "IndicatorLED property not exposed on this firmware."
+     *   - other → generic message + code.
+     *
+     * The result also carries `propertyUsed` ('IndicatorLED',
+     * 'LocationIndicatorActive', or 'Oem.Hpe.IndicatorLED') so the
+     * UI's optimistic-override path knows whether the badge should
+     * reflect the requested Lit/Blinking faithfully (IndicatorLED and
+     * Oem.Hpe.IndicatorLED both support all three values) or be
+     * normalized (LocationIndicatorActive maps both Lit and Blinking
+     * to a single 'true' state).
+     */
+    Map setIndicatorLed(String value) {
+        // Whitelist defensively — never proxy arbitrary user input into
+        // an iLO PATCH body.
+        if (!(value in ['Off', 'Lit', 'Blinking'])) {
+            return [success: false, errorMessage: "invalid UID state '${value}'"]
+        }
+        Map indicatorBody = [IndicatorLED: value]
+        Boolean liaValue = (value != 'Off')
+        Map liaBody = [LocationIndicatorActive: liaValue]
+        // v0.1.40 — nested-OEM body shape per HPE iLO 6 Redfish docs.
+        // The Oem/Hpe block sits at the top level of the resource so
+        // the writable IndicatorLED at Oem.Hpe.IndicatorLED is reached
+        // by PATCHing the parent resource with this nested structure.
+        Map oemBody = [Oem: [Hpe: [IndicatorLED: value]]]
+        Map<String, String> ifMatchStar = ['If-Match': '*']
+        List attempts = []
+
+        // Helper closure (param names path/withIfMatch/prop/resp deliberately
+        // chosen to not collide with any enclosing-method local — see the
+        // Groovy 3 sandbox-vs-runtime shadowing hazard documented in CHANGELOG).
+        Closure recordAttempt = { String path, boolean withIfMatch, String prop, Map resp ->
+            attempts << [
+                    path            : path,
+                    ifMatch         : withIfMatch,
+                    property        : prop,
+                    success         : (resp?.success ?: false),
+                    errorCode       : resp?.errorCode,
+                    errorMessage    : resp?.errorMessage,
+                    redfishMessageId: resp?.redfishMessageId
+            ]
+        }
+
+        // Step 1: /Systems/1, IndicatorLED, no If-Match.
+        Map a1 = patchJson('/redfish/v1/Systems/1', indicatorBody)
+        recordAttempt('/Systems/1', false, 'IndicatorLED', a1)
+        if (a1.success) return [success: true, attempts: attempts, propertyUsed: 'IndicatorLED']
+
+        // Step 2: /Systems/1, IndicatorLED, with If-Match: *.
+        Map a2 = patchJson('/redfish/v1/Systems/1', indicatorBody, ifMatchStar)
+        recordAttempt('/Systems/1', true, 'IndicatorLED', a2)
+        if (a2.success) return [success: true, attempts: attempts, propertyUsed: 'IndicatorLED']
+
+        // Step 3: /Chassis/1, IndicatorLED, no If-Match.
+        Map a3 = patchJson('/redfish/v1/Chassis/1', indicatorBody)
+        recordAttempt('/Chassis/1', false, 'IndicatorLED', a3)
+        if (a3.success) return [success: true, attempts: attempts, propertyUsed: 'IndicatorLED']
+
+        // Step 4: /Chassis/1, IndicatorLED, with If-Match: *.
+        Map a4 = patchJson('/redfish/v1/Chassis/1', indicatorBody, ifMatchStar)
+        recordAttempt('/Chassis/1', true, 'IndicatorLED', a4)
+        if (a4.success) return [success: true, attempts: attempts, propertyUsed: 'IndicatorLED']
+
+        // Step 5: /Systems/1, LocationIndicatorActive (DMTF newer property).
+        Map a5 = patchJson('/redfish/v1/Systems/1', liaBody)
+        recordAttempt('/Systems/1', false, 'LocationIndicatorActive', a5)
+        if (a5.success) return [success: true, attempts: attempts, propertyUsed: 'LocationIndicatorActive']
+
+        // Step 6: /Chassis/1, LocationIndicatorActive.
+        Map a6 = patchJson('/redfish/v1/Chassis/1', liaBody)
+        recordAttempt('/Chassis/1', false, 'LocationIndicatorActive', a6)
+        if (a6.success) return [success: true, attempts: attempts, propertyUsed: 'LocationIndicatorActive']
+
+        // Step 7: /Systems/1, Oem.Hpe.IndicatorLED — HPE OEM nested
+        // property. This is where iLO 6 v1.74 actually keeps the
+        // writable bit per HPE's own changelog. Body shape is
+        // {Oem:{Hpe:{IndicatorLED:value}}}.
+        Map a7 = patchJson('/redfish/v1/Systems/1', oemBody)
+        recordAttempt('/Systems/1', false, 'Oem.Hpe.IndicatorLED', a7)
+        if (a7.success) return [success: true, attempts: attempts, propertyUsed: 'Oem.Hpe.IndicatorLED']
+
+        // Step 8: /Chassis/1, Oem.Hpe.IndicatorLED.
+        Map a8 = patchJson('/redfish/v1/Chassis/1', oemBody)
+        recordAttempt('/Chassis/1', false, 'Oem.Hpe.IndicatorLED', a8)
+        if (a8.success) return [success: true, attempts: attempts, propertyUsed: 'Oem.Hpe.IndicatorLED']
+
+        // All eight attempts failed. Pick the dominant HTTP code: if every
+        // attempt returned the same code, that's the verdict. Otherwise
+        // prefer the Systems/1 IndicatorLED result (a1), which is the
+        // most common signal — Chassis/1 PATCH commonly 4xx's even on
+        // healthy boxes that DO allow Systems/1 PATCH.
+        Integer dominantCode = null
+        Set codes = attempts.findAll { it.errorCode != null }.collect { it.errorCode as Integer } as Set
+        if (codes.size() == 1) {
+            dominantCode = codes.iterator().next() as Integer
+        } else {
+            dominantCode = (a1.errorCode ?: a2.errorCode ?: a3.errorCode ?: a4.errorCode ?: a5.errorCode ?: a6.errorCode ?: a7.errorCode ?: a8.errorCode) as Integer
+        }
+
+        // For 400 specifically, the Redfish MessageId is the most
+        // informative signal. Walk the attempts and pick the first
+        // non-null MessageId — they should all be the same when the
+        // property/value is the issue, and different MessageIds across
+        // attempts means a mixed firmware quirk we want to see in the
+        // diagnostics row anyway.
+        String msgId = null
+        attempts.each { Map at ->
+            if (msgId == null && at?.redfishMessageId) msgId = at.redfishMessageId as String
+        }
+
+        String hint
+        switch (dominantCode) {
+            case 401:
+                hint = "iLO returned 401 — session token rejected. Retry, or check for concurrent iLO admin sessions."
+                break
+            case 403:
+                hint = "iLO returned 403 on all attempts. Two common causes — both worth checking before changing iLO RBAC: (1) iLO concurrent session pressure can manifest as 403 on writes while reads still work — close stale console windows and check the iloSessions diagnostic row; (2) the iLO user may need higher privileges, but the specific privilege varies by firmware version. See TROUBLESHOOTING.md → iLO user privileges."
+                break
+            case 400:
+                if (msgId && (msgId.contains('PropertyNotWritable') || msgId.contains('PropertyReadOnly') || msgId.contains('PropertyNotWritableOrUnknown'))) {
+                    hint = "iLO returned 400 (${msgId}) on all 8 attempts (DMTF IndicatorLED, LocationIndicatorActive, AND HPE OEM Oem.Hpe.IndicatorLED). The UID control property is genuinely unavailable for write on this firmware/hardware. File a GitHub issue with the iLO version and the uidActionAttempts row."
+                } else if (msgId && (msgId.contains('PropertyValueNotInList') || msgId.contains('PropertyValueNotInAllowableValues') || msgId.contains('PropertyValueTypeError'))) {
+                    hint = "iLO returned 400 (${msgId}) — the value '${value}' isn't in the allowed list for this firmware. Some HPE iLO firmware supports only Off and Blinking (not Lit) — try a different button."
+                } else if (msgId) {
+                    hint = "iLO returned 400 (${msgId}) on all attempts. See TROUBLESHOOTING.md → UID change failed for known message-IDs, and the Diagnostics row uidActionAttempts for the full breakdown."
+                } else {
+                    hint = "iLO returned 400 on all attempts (no Redfish MessageId in the response body). Check Diagnostics → uidActionAttempts for the iLO error message."
+                }
+                break
+            case 404:
+                hint = "iLO returned 404 — none of IndicatorLED, LocationIndicatorActive, or Oem.Hpe.IndicatorLED is writable on this firmware/hardware combination."
+                break
+            case 405:
+                hint = "iLO returned 405 — PATCH not allowed on this resource. Likely an iLO firmware quirk; please open a GitHub issue with the iLO version."
+                break
+            default:
+                hint = (dominantCode ? "iLO returned ${dominantCode} on all attempts." : "PATCH failed on all attempts.")
+        }
+
+        return [success: false, errorMessage: hint, errorCode: dominantCode, attempts: attempts, redfishMessageId: msgId]
+    }
+
+    /**
      * Aggregator. Pulls the standard tab status set in a single logged-in
      * session and returns a Map ready to bind to the template. Always logs
      * out before returning.
      */
-    Map collectStatus(String username, String password) {
+    Map collectStatus(String username, String password, String uidAction = null) {
         Map result = [success: false, error: null]
         try {
             login(username, password)
+
+            // v0.1.38 — if the user clicked an Off/Lit/Blinking button in
+            // the UID cell, the click navigates to ?argusUidAction=<value>
+            // and renderTemplate forwards that value here. Do the PATCH
+            // BEFORE the bulk-read so the subsequent GET on /Systems/1
+            // and /Chassis/1 reflects the new state. We also stash the
+            // requested value so we can optimistically override the read
+            // value below if the GETs lag iLO's internal commit by a
+            // tick or two.
+            if (uidAction) {
+                Map uidResult = setIndicatorLed(uidAction)
+                result.uidActionRequested = uidAction
+                result.uidActionSuccess   = uidResult.success
+                result.uidActionError     = uidResult.errorMessage
+                // v0.1.39 — bubble up the per-attempt detail so diagnostics
+                // can show which paths were tried (Systems/1 vs Chassis/1,
+                // IndicatorLED vs LocationIndicatorActive) and whether
+                // If-Match: * was used. Helps distinguish RBAC (every
+                // attempt the same code) from firmware quirks (different
+                // codes per path) and tells the badge-render block which
+                // property carried the write through.
+                result.uidActionAttempts     = uidResult.attempts
+                result.uidActionPropertyUsed = uidResult.propertyUsed
+                result.uidActionMessageId    = uidResult.redfishMessageId
+                log.info("iLO ${iloHost}: UID PATCH ${uidAction} → success=${uidResult.success}${uidResult.errorMessage ? ' (' + uidResult.errorMessage + ')' : ''} — attempts: ${uidResult.attempts}")
+            }
+
             def root = getJson('/redfish/v1/') ?: [:]
             def system = getJson('/redfish/v1/Systems/1') ?: [:]
             def manager = getJson('/redfish/v1/Managers/1') ?: [:]
@@ -262,7 +619,93 @@ class RedfishClient {
                 def chassis = getJson('/redfish/v1/Chassis/1') ?: [:]
                 result.assetTag = chassis.AssetTag
                 result.chassisSku = chassis.SKU
-                result.indicatorLed = chassis.IndicatorLED
+                // v0.1.38 — read IndicatorLED from Chassis/1 first, then
+                // fall back to Systems/1. Different HPE firmware versions
+                // populate one or the other; defender (iLO 6 Gen11) only
+                // reports it on Systems/1, which is why v0.1.37's read
+                // (Chassis only) silently dropped the cell from the
+                // System card.
+                //
+                // v0.1.39 — additional fallback to LocationIndicatorActive
+                // (DMTF newer boolean property). iLO 6 1.74+ on Gen11
+                // populates this instead of IndicatorLED on some firmware
+                // revisions, which is why v0.1.38's badge showed "—"
+                // (em-dash = Unknown) even with a healthy UID system. We
+                // map true → 'Lit' (we can't distinguish Lit from
+                // Blinking from a boolean) and false → 'Off', and stash
+                // which property we ended up reading from in
+                // indicatorLedSource so diagnostics can show it.
+                //
+                // v0.1.40 — final fallback to Oem.Hpe.IndicatorLED. HPE
+                // documents this OEM property as the canonical read-AND-
+                // write property on modern iLO 6 firmware where the
+                // DMTF top-level IndicatorLED is read-only and may not
+                // even be populated. Try this last so we prefer DMTF
+                // standard properties when they're available — but use
+                // it when both are absent. Lit/Blinking/Off values
+                // round-trip faithfully.
+                String iLed = (chassis.IndicatorLED ?: system.IndicatorLED) as String
+                if (iLed && !iLed.equalsIgnoreCase('Unknown')) {
+                    result.indicatorLed       = iLed
+                    result.indicatorLedSource = 'IndicatorLED'
+                } else {
+                    // Boolean fallback. .containsKey check distinguishes
+                    // "property present, value=false" from "property
+                    // missing entirely" — we only want the fallback to
+                    // take effect when the new property is actually
+                    // present, otherwise we'd misreport every box that
+                    // has neither property as 'Off'.
+                    Boolean lia = null
+                    if (chassis instanceof Map && (chassis as Map).containsKey('LocationIndicatorActive')) {
+                        lia = (chassis as Map).LocationIndicatorActive as Boolean
+                    } else if (system instanceof Map && (system as Map).containsKey('LocationIndicatorActive')) {
+                        lia = (system as Map).LocationIndicatorActive as Boolean
+                    }
+                    if (lia != null) {
+                        result.indicatorLed       = lia ? 'Lit' : 'Off'
+                        result.indicatorLedSource = 'LocationIndicatorActive'
+                    } else {
+                        // v0.1.40 — Oem.Hpe.IndicatorLED.
+                        def chOem = (chassis instanceof Map) ? (chassis as Map).Oem : null
+                        def chHpe = (chOem instanceof Map) ? (chOem as Map).Hpe : null
+                        def chHpeLed = (chHpe instanceof Map) ? (chHpe as Map).IndicatorLED : null
+                        def sysOem = (system instanceof Map) ? (system as Map).Oem : null
+                        def sysHpe = (sysOem instanceof Map) ? (sysOem as Map).Hpe : null
+                        def sysHpeLed = (sysHpe instanceof Map) ? (sysHpe as Map).IndicatorLED : null
+                        String oemLed = (chHpeLed ?: sysHpeLed) as String
+                        if (oemLed && !oemLed.equalsIgnoreCase('Unknown') && !oemLed.equalsIgnoreCase('Null')) {
+                            result.indicatorLed       = oemLed
+                            result.indicatorLedSource = 'Oem.Hpe.IndicatorLED'
+                        } else {
+                            result.indicatorLed       = iLed   // null or 'Unknown'
+                            result.indicatorLedSource = null
+                        }
+                    }
+                }
+                // After a successful PATCH the GET above can lag iLO's
+                // internal commit by a tick. Override optimistically so
+                // the user sees the requested state immediately and
+                // doesn't double-click thinking nothing happened.
+                //
+                // v0.1.39 — when the PATCH succeeded via LocationIndicatorActive
+                // (boolean — no Lit/Blinking distinction), normalize the
+                // optimistic override too: requested 'Lit' or 'Blinking'
+                // both display as 'Lit' on the badge, because iLO has no
+                // way to confirm which one we got.
+                if (result.uidActionSuccess && result.uidActionRequested) {
+                    String requested = result.uidActionRequested as String
+                    String prop = result.uidActionPropertyUsed as String
+                    if (prop == 'LocationIndicatorActive' && requested == 'Blinking') {
+                        // Map Blinking → Lit for the badge when we can't
+                        // tell them apart from the property's boolean type.
+                        result.indicatorLed = 'Lit'
+                    } else {
+                        result.indicatorLed = requested
+                    }
+                    // v0.1.40 — keep the diagnostics source consistent
+                    // with the property that carried the write through.
+                    if (prop) result.indicatorLedSource = prop
+                }
             } catch (Throwable t) {
                 log.debug("iLO ${iloHost} Chassis read failed: ${t.message}")
             }
@@ -514,10 +957,20 @@ class RedfishClient {
             // v0.1.29: active iLO sessions (HPE OEM). Tells you who else is
             // logged into this iLO right now — useful for "is the console
             // already in use?" before launching IRC.
+            //
+            // v0.1.41 — also capture the total session count INCLUDING our
+            // own. iLO 6 caps concurrent sessions at ~13 across all clients
+            // (web UI, IRC console, REST API, sessionkey launches); writes
+            // start failing with misleading PropertyNotWritableOrUnknown
+            // errors before reads do when the pool is saturated. The total
+            // count surfaces this pressure in the Diagnostics row before
+            // it triggers cryptic UID PATCH failures.
             try {
                 def sessColl = getJson('/redfish/v1/SessionService/Sessions') ?: [:]
+                List sessionsMembers = (sessColl.Members ?: []) as List
+                result.totalSessionCount = sessionsMembers.size()
                 List sessions = []
-                (sessColl.Members ?: []).each { sRef ->
+                sessionsMembers.each { sRef ->
                     String sPath = sRef?.'@odata.id' as String
                     if (!sPath) return
                     def sess = getJson(sPath)
@@ -727,6 +1180,17 @@ class RedfishClient {
                                 speedMbps = ((p.CurrentSpeedGbps as Integer) * 1000) as Integer
                             }
                             def portOem = p.Oem?.Hpe ?: [:]
+                            // v0.1.36 — capture WWPN for FibreChannel/SAS HBA ports.
+                            // Format varies by firmware:
+                            //   iLO 6:  p.FibreChannel?.WWPN  or  p.Oem?.Hpe?.WWPN
+                            //   iLO 5:  p.FibreChannel?.WWPN
+                            // SAS HBAs may not report WWPN at all.
+                            String wwpn = null
+                            try {
+                                wwpn = (p.FibreChannel?.WWPN as String)?.trim() ?:
+                                        (portOem?.WWPN as String)?.trim() ?:
+                                        null
+                            } catch (Throwable ignored) {}
                             adapter.ports << [
                                     id               : p.Id,
                                     name             : p.Name,
@@ -735,6 +1199,7 @@ class RedfishClient {
                                     speedMbps        : speedMbps,
                                     activeTech       : p.ActiveLinkTechnology,
                                     macs             : macs.collect { it?.toString() }.findAll { it },
+                                    wwpn             : wwpn,
                                     health           : p.Status?.Health,
                                     state            : p.Status?.State,
                                     // HPE OEM extensions — drive the NIC LED card
