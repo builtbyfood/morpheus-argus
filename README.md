@@ -318,6 +318,11 @@ Not yet implemented, in priority order:
    plugin option-type form.
 3. **Multi-iLO inventory view** — a separate dashboard provider that
    lists all iLO-managed hosts with summary status.
+4. **Indicator LED toggle** — single button in the System card to flip
+   the chassis identifier LED on/off. (Not power control per se, but
+   uses the same `PATCH /Chassis/1` mechanism that power actions would.
+   Useful when you're physically in the rack identifying a specific
+   server.)
 
 ---
 

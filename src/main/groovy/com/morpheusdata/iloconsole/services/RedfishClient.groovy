@@ -4,6 +4,8 @@ import com.morpheusdata.core.util.HttpApiClient
 import groovy.json.JsonOutput
 import groovy.util.logging.Slf4j
 
+import java.net.URI
+
 /**
  * Minimal HPE iLO Redfish client. Mirrors the auth pattern from the SiLO
  * Home Assistant integration:
@@ -76,6 +78,171 @@ class RedfishClient {
             this.authToken = null
             this.sessionLocation = null
         }
+    }
+
+    /**
+     * v0.1.46 — delete every OTHER session belonging to the same iLO user
+     * we just logged in as, keeping only the current session (identified
+     * by sessionLocation).
+     *
+     * Rationale: each tab render creates two sessions — one for
+     * collectStatus (properly logged out in the finally block at the end
+     * of the render) and one via acquireLaunchToken for the sessionkey
+     * URL launch path (intentionally NOT logged out so the user's click
+     * on the launch URL arrives at a still-valid token). The launch
+     * token session leaks by design, and repeated tab renders without
+     * console launches still accumulate them because iLO only reaps
+     * idle sessions after ~30 minutes. Combined with any human operator
+     * activity on the same iLO account, the ~13-session pool can
+     * saturate in an afternoon. Once saturated, PATCH writes start
+     * failing with misleading `PropertyNotWritableOrUnknown` errors
+     * (see the v0.1.41 session-limit documentation) even though reads
+     * keep working — the failure mode is intermittent and hard to
+     * blame on the plugin.
+     *
+     * v0.1.47 — CRITICAL fix. v0.1.46's `sPath == sessionLocation`
+     * comparison never matched because:
+     *   - `sessionLocation` from the Location header on POST /Sessions
+     *     is an ABSOLUTE URL on HPE iLO 6/7 (e.g.
+     *     `https://192.168.0.248/redfish/v1/SessionService/Sessions/xxx`).
+     *   - `Members[].@odata.id` from the Sessions collection is a
+     *     RELATIVE PATH (e.g. `/redfish/v1/SessionService/Sessions/xxx`).
+     * The comparison saw them as different strings, cleanup deleted
+     * every session including the one we just created for the render,
+     * subsequent GETs 401'd, and the tab rendered with nulls
+     * everywhere. Now we normalize both sides to path form before
+     * comparing, plus paranoid guards:
+     *   (a) If normalization returns null/empty for our current session,
+     *       skip cleanup entirely rather than risk a wildcard delete.
+     *   (b) Even if the normalized comparison somehow still misses (e.g.
+     *       trailing slashes, case sensitivity), we also compare the
+     *       LAST PATH SEGMENT (the session id) so a session with our id
+     *       is never deleted.
+     *   (c) Cap the delete count at (member count - 1) so we always
+     *       leave at least one session alive on this iLO. Belt AND
+     *       suspenders.
+     *
+     * Design:
+     *   - Only delete sessions belonging to the SAME UserName we
+     *     authenticated as. Other users' sessions (iLO web UI,
+     *     administrators, other integrations) are strictly off-limits;
+     *     killing an operator's live console session would be much
+     *     worse than a saturated session pool.
+     *   - Skip the current session using the normalized path comparison
+     *     plus the id-tail safety net.
+     *   - Best-effort: swallow any per-session DELETE failure so a
+     *     single stuck session doesn't abort cleanup of the rest. iLO
+     *     will reap what we couldn't after the timeout.
+     *
+     * Returns the number of sessions actually deleted, for surfacing in
+     * the diagnostics row.
+     */
+    int cleanupOwnStaleSessions(String username) {
+        if (!authToken || !username) return 0
+        // v0.1.47 — normalize our own session location to a path so we
+        // can compare against Members[].@odata.id (which is always a
+        // path).
+        String ourSessionPath = normalizeSessionPath(sessionLocation)
+        String ourSessionId   = tailSegment(ourSessionPath)
+        if (!ourSessionPath || !ourSessionId) {
+            log.warn("iLO ${iloHost}: cleanupOwnStaleSessions skipped — sessionLocation could not be normalized (${sessionLocation})")
+            return 0
+        }
+        int deleted = 0
+        try {
+            def sessColl = getJson('/redfish/v1/SessionService/Sessions')
+            if (sessColl == null) return 0
+            List members = (sessColl instanceof Map && (sessColl as Map).get('Members') instanceof List)
+                    ? (sessColl as Map).get('Members') as List
+                    : Collections.emptyList()
+            // v0.1.47 — safety cap: never delete more than (memberCount - 1)
+            // sessions on this iLO in one cleanup pass. Even if every
+            // filter above somehow lets the current session through, this
+            // guarantees we can't kill the last session standing.
+            int maxDeletes = Math.max(0, members.size() - 1)
+            for (def sRef : members) {
+                if (deleted >= maxDeletes) {
+                    log.info("iLO ${iloHost}: cleanupOwnStaleSessions hit safety cap of ${maxDeletes} deletes; stopping")
+                    break
+                }
+                String sPathRaw = null
+                if (sRef instanceof Map) sPathRaw = (sRef as Map).get('@odata.id') as String
+                if (!sPathRaw) continue
+                String sPath = normalizeSessionPath(sPathRaw)
+                String sId   = tailSegment(sPath)
+                // Skip the session we're currently using for this render.
+                // Belt (path match) AND suspenders (id tail match).
+                if (sPath == ourSessionPath) continue
+                if (sId && sId == ourSessionId) continue
+                def sess = null
+                try { sess = getJson(sPath) } catch (Throwable ignoredGet) { continue }
+                if (!(sess instanceof Map)) continue
+                String sUser = (sess as Map).get('UserName') as String
+                // Only touch sessions owned by the same user we
+                // authenticated as — never other users.
+                if (!sUser || sUser != username) continue
+                try {
+                    HttpApiClient.RequestOptions opts = new HttpApiClient.RequestOptions(
+                            headers: ['X-Auth-Token': authToken, 'Accept': 'application/json'],
+                            ignoreSSL: !verifySsl
+                    )
+                    def resp = http.callJsonApi(baseUrl(), sPath, opts, 'DELETE')
+                    if (resp != null && resp.success) deleted++
+                } catch (Throwable delErr) {
+                    log.debug("iLO ${iloHost}: cleanup DELETE ${sPath} failed: ${delErr.message}")
+                }
+            }
+        } catch (Throwable t) {
+            log.warn("iLO ${iloHost}: cleanupOwnStaleSessions failed: ${t.message}")
+        }
+        if (deleted > 0) log.info("iLO ${iloHost}: cleaned up ${deleted} stale session(s) for user ${username}")
+        return deleted
+    }
+
+    /**
+     * v0.1.47 — normalize a session URL/path to path form for
+     * comparison. HPE iLO's Location header on POST /Sessions is
+     * sometimes an absolute URL and sometimes a relative path
+     * depending on firmware; @odata.id inside the Sessions collection
+     * is always relative. Comparing the two directly without
+     * normalization was the v0.1.46 bug.
+     *
+     * Also strips any trailing slash so `/Sessions/xxx/` and
+     * `/Sessions/xxx` compare equal.
+     */
+    private static String normalizeSessionPath(String loc) {
+        if (!loc) return null
+        String path = loc
+        if (path.contains('://')) {
+            try {
+                URI u = new URI(loc)
+                path = u.path
+            } catch (Throwable ignoredUri) {
+                // Manual fallback if URI parsing fails.
+                int schemeEnd = loc.indexOf('://')
+                if (schemeEnd >= 0) {
+                    int pathStart = loc.indexOf('/', schemeEnd + 3)
+                    path = (pathStart >= 0) ? loc.substring(pathStart) : ''
+                }
+            }
+        }
+        if (path && path.length() > 1 && path.endsWith('/')) {
+            path = path.substring(0, path.length() - 1)
+        }
+        return path
+    }
+
+    /**
+     * v0.1.47 — return the last path segment of a URL/path. Used as a
+     * secondary safety-net check so a session's id can match even if
+     * the path normalization somehow drifted.
+     */
+    private static String tailSegment(String pathOrUrl) {
+        if (!pathOrUrl) return null
+        String s = pathOrUrl
+        if (s.endsWith('/')) s = s.substring(0, s.length() - 1)
+        int lastSlash = s.lastIndexOf('/')
+        return (lastSlash >= 0 && lastSlash < s.length() - 1) ? s.substring(lastSlash + 1) : s
     }
 
     /**
@@ -432,6 +599,23 @@ class RedfishClient {
         Map result = [success: false, error: null]
         try {
             login(username, password)
+
+            // v0.1.46 — clean up stale sessions for our user before doing
+            // any other work. Prevents session pool saturation from
+            // repeated tab renders (each render's launch-token session
+            // was designed to leak so the sessionkey stays valid for the
+            // user's console launch — but stale ones from previous
+            // renders accumulate until iLO's ~30-minute idle reap kicks
+            // in). This runs after login so we have an auth token, and
+            // before any other work so the pool is clean before any
+            // reads or subsequent acquireLaunchToken create fresh
+            // sessions. Only touches sessions for the same UserName we
+            // authenticated as — other users' sessions (iLO web UI,
+            // administrators, external integrations) are strictly
+            // off-limits. Best-effort: cleanup errors don't abort the
+            // render, they just get logged and surfaced in the
+            // diagnostics row.
+            result.sessionsCleanedUp = cleanupOwnStaleSessions(username)
 
             // v0.1.38 — if the user clicked an Off/Lit/Blinking button in
             // the UID cell, the click navigates to ?argusUidAction=<value>
@@ -1056,42 +1240,151 @@ class RedfishClient {
                     log.debug("iLO ${iloHost} EnvironmentMetrics read failed: ${t.message}")
                 }
                 // PowerMeter — historical samples. HPE OEM extension under
-                // /Chassis/1/Power/PowerMeter on iLO 6. Shape:
-                //   { Samples: [ {Time: "2026-...", Average: 42, Maximum: 50}, ... ] }
-                // Samples are oldest-first; we want newest at the right edge of
-                // the sparkline, so we keep the array as-is (left→right = oldest→newest).
-                try {
-                    def pm = getJson('/redfish/v1/Chassis/1/Power/PowerMeter')
-                    if (pm != null) {
-                        List samples = (pm.Samples ?: []) as List
-                        if (samples) {
-                            // Cap at last 60 samples — the sparkline width
-                            // is small and dense polylines just look noisy.
-                            int keep = Math.min(samples.size(), 60)
-                            List tail = samples.subList(samples.size() - keep, samples.size())
-                            List hist = tail.collect { s ->
-                                [
-                                        ts  : s.Time as String,
-                                        avg : (s.Average != null ? (s.Average as Integer) : null),
-                                        max : (s.Maximum != null ? (s.Maximum as Integer) : null)
-                                ]
-                            }.findAll { it.avg != null || it.max != null }
-                            trend.history = hist
-                            // Sample-derived stats — only set if we don't have
-                            // them from EnvironmentMetrics already
-                            if (hist) {
-                                List avgs = hist.collect { (it.avg ?: it.max) as Integer }.findAll { it != null }
-                                if (avgs) {
-                                    if (trend.min == null) trend.min = avgs.min() as Integer
-                                    if (trend.max == null) trend.max = avgs.max() as Integer
-                                    trend.avg = ((avgs.sum() as Integer) / avgs.size()) as Integer
-                                }
-                                trend.source = trend.source ? "${trend.source}+PowerMeter" : 'PowerMeter'
-                            }
+                // /Chassis/1/Power/PowerMeter on iLO 5, plus a peer endpoint
+                // /Chassis/1/Power/FastPowerMeter that carries the same
+                // schema on iLO 5 (~20 minute high-res).
+                //
+                // v0.1.44 — added FastPowerMeter probe fallback for
+                // firmware that only populates one of the two URIs.
+                //
+                // v0.1.45 — property name fix. iLO 5 uses:
+                //   { Samples: [{Time, Average, Maximum}, ...] }
+                // iLO 6 / iLO 7 renamed the array to `PowerDetail` with
+                // richer fields per entry:
+                //   { PowerDetail: [{Time, Average, Peak, Minimum,
+                //                    CpuWatts, DimmWatts, GpuWatts,
+                //                    SharedFanWatts}, ...] }
+                // Reference: iLO 7 changelog HpePowerMeter.v2_1_0 →
+                // v2_2_0 adds PowerDetail[{item}].SharedFanWatts;
+                // iLO 6 v1.68 resource map lists the same HpePowerMeter
+                // type at both /PowerMeter and /FastPowerMeter URIs.
+                //
+                // Behavior: try PowerDetail first (iLO 6/7, current fleet);
+                // fall back to Samples (iLO 5, still supported). Map
+                // Peak→trend max on iLO 6/7, Maximum→trend max on iLO 5.
+                // Capture Minimum from PowerDetail entries when present
+                // (iLO 5 didn't emit this in Samples).
+                //
+                // Diagnostic capture: each probe records its URL and the
+                // integer sample count it returned (or -1 for HTTP null).
+                // Both probes are always attempted for the diagnostics row
+                // so future firmware variance is visible in one render
+                // without redeploying.
+                List meterProbes = []
+                Closure<Map> readMeter = { String path, String sourceLabel ->
+                    try {
+                        def pm = getJson(path)
+                        if (pm == null) {
+                            meterProbes << [path: path, count: -1]
+                            return null
                         }
+                        // v0.1.46 — capture top-level keys of the response
+                        // so the diagnostics row can show what iLO actually
+                        // returned. Same forensics pattern that unblocked
+                        // the settings and UID chains: when the caller sees
+                        // 0 samples we want to see the response body's
+                        // shape, not guess. Filter out @odata.* metadata
+                        // keys since those aren't informative and eat
+                        // display width.
+                        List topKeys = null
+                        if (pm instanceof Map) {
+                            topKeys = ((pm as Map).keySet().collect { it as String })
+                                    .findAll { !(it as String).startsWith('@') } as List
+                        }
+                        // v0.1.45 — PowerDetail (iLO 6/7) preferred over
+                        // Samples (iLO 5). If both are populated (shouldn't
+                        // happen but be defensive), take whichever is
+                        // longer, which is likely PowerDetail on iLO 6/7.
+                        //
+                        // v0.1.46 — explicit instanceof checks instead of
+                        // relying on Groovy truthy semantics. v0.1.45 threw
+                        // `java.lang.Integer.isEmpty()` on this codepath —
+                        // one of the two Redfish properties resolved to a
+                        // non-List type on iLO 6 v1.76 (likely an integer
+                        // count companion property or a nested object),
+                        // and the downstream `if (pd && sm)` truthy check
+                        // invoked `.isEmpty()` on it. instanceof-and-cast
+                        // is rock solid: if the value is anything other
+                        // than a List, we treat it as absent. The concrete
+                        // shape doesn't matter to us; we only care about
+                        // the array of history entries.
+                        def rawPd = null
+                        def rawSm = null
+                        if (pm instanceof Map) {
+                            rawPd = (pm as Map).get('PowerDetail')
+                            rawSm = (pm as Map).get('Samples')
+                        }
+                        List pd = (rawPd instanceof List) ? (rawPd as List) : Collections.emptyList()
+                        List sm = (rawSm instanceof List) ? (rawSm as List) : Collections.emptyList()
+                        // Prefer PowerDetail (iLO 6/7) if it has entries.
+                        // Fall back to Samples (iLO 5) if PowerDetail is
+                        // empty but Samples isn't. If both empty, entries
+                        // stays empty and we return null via the guard.
+                        List entries
+                        if (!pd.isEmpty()) {
+                            entries = pd
+                        } else if (!sm.isEmpty()) {
+                            entries = sm
+                        } else {
+                            entries = Collections.emptyList()
+                        }
+                        meterProbes << [path: path, count: entries.size(), topKeys: topKeys]
+                        if (entries.isEmpty()) return null
+                        int keep = Math.min(entries.size(), 60)
+                        List tail = entries.subList(entries.size() - keep, entries.size())
+                        List hist = tail.collect { entry ->
+                            // v0.1.46 — same instanceof-and-cast pattern
+                            // for entries. If a sample entry isn't a Map
+                            // (shouldn't happen but be defensive), skip
+                            // its property accesses so this closure can't
+                            // trip Groovy's dynamic method dispatch on an
+                            // unexpected type.
+                            if (!(entry instanceof Map)) return null
+                            Map s = entry as Map
+                            [
+                                    ts  : s.get('Time') as String,
+                                    avg : (s.get('Average') != null ? (s.get('Average') as Integer) : null),
+                                    // v0.1.45 — Peak (iLO 6/7) supersedes
+                                    // Maximum (iLO 5); check both so this
+                                    // works across the fleet.
+                                    max : (s.get('Peak')    != null ? (s.get('Peak')    as Integer)
+                                            : (s.get('Maximum') != null ? (s.get('Maximum') as Integer) : null)),
+                                    // v0.1.45 — Minimum only exists on
+                                    // PowerDetail; null on iLO 5 Samples.
+                                    min : (s.get('Minimum') != null ? (s.get('Minimum') as Integer) : null)
+                            ]
+                        }.findAll { it != null && (it.avg != null || it.max != null) }
+                        if (hist.isEmpty()) return null
+                        return [history: hist, source: sourceLabel]
+                    } catch (Throwable t) {
+                        log.debug("iLO ${iloHost} ${sourceLabel} read failed: ${t.message}")
+                        meterProbes << [path: path, count: -1, error: (t.message ?: t.class.simpleName)]
+                        return null
                     }
-                } catch (Throwable t) {
-                    log.debug("iLO ${iloHost} PowerMeter read failed: ${t.message}")
+                }
+                Map meterResult = readMeter('/redfish/v1/Chassis/1/Power/PowerMeter', 'PowerMeter')
+                if (meterResult == null) {
+                    // Fallback for firmware that only populates the
+                    // 20-minute FastPowerMeter (all Gen11+ on iLO 6 v1.76
+                    // in field testing).
+                    meterResult = readMeter('/redfish/v1/Chassis/1/Power/FastPowerMeter', 'FastPowerMeter')
+                }
+                trend.meterProbes = meterProbes
+                if (meterResult != null) {
+                    List hist = meterResult.history as List
+                    trend.history = hist
+                    // Sample-derived stats — only set if we don't have
+                    // them from EnvironmentMetrics already. v0.1.45 uses
+                    // per-entry Minimum when PowerDetail is the source,
+                    // otherwise falls back to min-of-avgs like before.
+                    List avgs = hist.collect { ((it as Map).avg ?: (it as Map).max) as Integer }.findAll { it != null }
+                    if (avgs) {
+                        List mins = hist.collect { (it as Map).min as Integer }.findAll { it != null }
+                        if (trend.min == null) trend.min = (mins ? mins.min() : avgs.min()) as Integer
+                        if (trend.max == null) trend.max = avgs.max() as Integer
+                        trend.avg = ((avgs.sum() as Integer) / avgs.size()) as Integer
+                    }
+                    trend.source = trend.source ? "${trend.source}+${meterResult.source}" : (meterResult.source as String)
                 }
                 // Cross-fill from the existing /Power read so the card has
                 // *something* useful even if EnvironmentMetrics and PowerMeter

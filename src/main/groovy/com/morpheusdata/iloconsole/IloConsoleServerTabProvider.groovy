@@ -1112,7 +1112,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                         html.append(renderPowerSparkline(ptHist))
                     } else {
                         html.append('<div style="flex:1; min-width:240px; padding:18px 12px; background:var(--argus-bg-card); border-radius:3px; font-size:11px; opacity:0.55; text-align:center; line-height:1.5;">')
-                        html.append('No history available<br><span style="font-size:10px;">iLO didn\'t return /Power/PowerMeter samples on this hardware tier</span>')
+                        html.append('No history available<br><span style="font-size:10px;">iLO didn\'t return /Power/PowerMeter or /Power/FastPowerMeter samples on this hardware</span>')
                         html.append('</div>')
                     }
 
@@ -1648,7 +1648,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
 
             // Diagnostics (collapsed by default)
             html.append('<details style="background:var(--argus-bg-diag); padding:10px 14px; border-radius:4px; margin-top:14px;">')
-            html.append('<summary style="cursor:pointer; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; opacity:0.5;">Diagnostics (v0.1.43)</summary>')
+            html.append('<summary style="cursor:pointer; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; opacity:0.5;">Diagnostics (v0.1.47)</summary>')
             html.append('<table style="font-family:monospace; font-size:11px; width:100%; margin-top:10px;">')
             diag.each { k, v ->
                 html.append("<tr><td style=\"opacity:0.55; padding-right:24px; padding-bottom:2px;\">${escapeHtml(k as String)}</td><td>${escapeHtml(v?.toString())}</td></tr>")
@@ -1764,9 +1764,18 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                     sessHint = ''
                     sessColor = null
                 }
+                // v0.1.46 — annotate with the number of stale sessions
+                // we cleaned up at the start of this render. When the
+                // cleanup fires, the total count you're looking at
+                // reflects the POST-cleanup state, so this makes the
+                // reduction visible ("cleaned N" appears after the
+                // count). Silent when no cleanup happened, so unchanged
+                // wording on the majority of renders.
+                Integer cleaned = (status.sessionsCleanedUp as Integer) ?: 0
+                String cleanedTag = cleaned > 0 ? " <span style=\"opacity:0.6;\">(cleaned ${cleaned} stale on login)</span>" : ''
                 String sessCell = sessColor
-                        ? "<span style=\"color:${sessColor};\">${sessCount}</span>${sessHint}"
-                        : "${sessCount}${sessHint}"
+                        ? "<span style=\"color:${sessColor};\">${sessCount}</span>${sessHint}${cleanedTag}"
+                        : "${sessCount}${sessHint}${cleanedTag}"
                 html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">iloSessions</td><td>${sessCell}</td></tr>")
             }
             if (status?.indicatorLed) {
@@ -1803,6 +1812,44 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
                 int histSize = ((ptrendDiag.history ?: []) as List).size()
                 String ptrendStr = "source=${ptrendDiag.source ?: 'none'}, history=${histSize} samples, current=${ptrendDiag.current ?: 'null'}"
                 html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">powerTrend</td><td style=\"font-family:ui-monospace,monospace; font-size:11px;\">${escapeHtml(ptrendStr)}</td></tr>")
+                // v0.1.45 — per-endpoint probe trace for HpePowerMeter.
+                // Each probe records the URL and count of entries found
+                // (Samples for iLO 5 or PowerDetail for iLO 6/7). Count
+                // of -1 means the HTTP call returned null (usually 404 or
+                // an unexpected exception). Row appears only when at
+                // least one probe was attempted so it stays out of the
+                // way on hardware where the sparkline is populated
+                // straight from a first-hit probe.
+                List meterProbesDiag = (ptrendDiag.meterProbes ?: []) as List
+                if (meterProbesDiag) {
+                    StringBuilder mpSb = new StringBuilder()
+                    meterProbesDiag.eachWithIndex { Object mp, int mpIdx ->
+                        Map mpm = mp as Map
+                        if (mpIdx > 0) mpSb.append(' &middot; ')
+                        String pathStr = (mpm.path as String) ?: '?'
+                        int cnt = (mpm.count as Integer) ?: 0
+                        String cntStr = (cnt < 0) ? 'null' : "${cnt} entries"
+                        String errStr = mpm.error ? " (err: ${mpm.error})" : ''
+                        // v0.1.46 — when we got a response but zero
+                        // entries, show the response's top-level keys so
+                        // we can see what iLO returned. Renders as
+                        // "keys=[AveragePowerReading, PowerDetail, ...]"
+                        // right after the count. Filters have already
+                        // dropped @odata.* metadata so this stays short.
+                        String keysStr = ''
+                        if (cnt == 0 && mpm.topKeys) {
+                            List tks = (mpm.topKeys as List)
+                            if (!tks.isEmpty()) {
+                                keysStr = " keys=[${tks.take(10).join(', ')}${tks.size() > 10 ? ', ...' : ''}]"
+                            }
+                        }
+                        // Shorten the URL for display — the /redfish/v1/Chassis/1
+                        // prefix is redundant on every probe and just eats width.
+                        String shortPath = pathStr.replaceFirst('^/redfish/v1/Chassis/1', '')
+                        mpSb.append("${shortPath}: ${cntStr}${keysStr}${errStr}")
+                    }
+                    html.append("<tr><td style=\"opacity:0.55; padding-right:24px;\">meterProbes</td><td style=\"font-family:ui-monospace,monospace; font-size:11px;\">${escapeHtml(mpSb.toString())}</td></tr>")
+                }
                 List naDiag = (status.networkAdapters ?: []) as List
                 int totalPortsDiag = (naDiag.sum { ((it.ports ?: []) as List).size() } ?: 0) as Integer
                 // v0.1.36 — count NIC vs HBA ports for at-a-glance verification

@@ -4,6 +4,307 @@ All notable changes to the `morpheus-ilo-console` plugin. The version numbers
 trace the actual iteration history; lessons learned at each step are summarized
 in the `Notes` rows because they explain why the next version exists.
 
+## 0.1.47 — Session cleanup fix: normalize path comparison so we don't delete our own session
+
+v0.1.46 introduced `cleanupOwnStaleSessions()` to keep the iLO session
+pool from saturating. Field testing on behemoth surfaced a bad
+regression: the tab rendered with `SYSTEM: POWER=? · MEMORY=? GiB`,
+every card empty, and diagnostics showing
+`iloSessions: 0 (cleaned 1 stale on login)`, `powerTrend: current=null`,
+every drives-counter zero. Cleanup had deleted our own current
+session along with the stale ones, and every subsequent GET was
+returning 401 from an invalidated token.
+
+Root cause was a path-vs-URL mismatch that never fires on happy-path
+testing:
+
+- `sessionLocation` comes from the `Location` header on `POST
+  /Sessions`. On HPE iLO 6/7 firmware this is an **absolute URL**
+  like `https://192.168.0.248/redfish/v1/SessionService/Sessions/xxx`.
+- `Members[].@odata.id` from `/SessionService/Sessions` is a
+  **relative path** like `/redfish/v1/SessionService/Sessions/xxx`.
+
+v0.1.46's `if (sPath == sessionLocation) continue` compared the two
+strings directly. They never matched, cleanup deleted every session
+for our user, and the current render's session went with them.
+
+The launchToken row still read `minted (length=32)` because
+`acquireLaunchToken()` uses an independent RedfishClient instance
+with its own login — it was untouched.
+
+### What changed
+
+- **Fixed.** `cleanupOwnStaleSessions()` now normalizes both sides to
+  path form before comparing. New private helper
+  `normalizeSessionPath(String loc)` uses `java.net.URI` to extract
+  the path from an absolute URL, falls back to manual scheme parsing
+  if URI construction throws, and strips any trailing slash so
+  `/Sessions/xxx/` and `/Sessions/xxx` compare equal. Applied to
+  both our own `sessionLocation` and each `Members[].@odata.id`
+  before the equality check.
+
+- **Added.** Belt-and-suspenders secondary check. A new helper
+  `tailSegment(String pathOrUrl)` extracts the last path segment
+  (the session id). We compare both the normalized paths AND the
+  tail segments — so even if some future firmware quirk breaks the
+  path normalization, a session whose id matches ours is still
+  never touched.
+
+- **Added.** Safety cap. Cleanup will never delete more than
+  `(memberCount - 1)` sessions in one pass — at least one session
+  always survives, no matter what the filters do. Logged as
+  `cleanupOwnStaleSessions hit safety cap of N deletes; stopping`
+  if it fires.
+
+- **Added.** Bail-out guard. If `normalizeSessionPath(sessionLocation)`
+  returns null or empty (should be impossible after a successful
+  login, but be paranoid), cleanup is skipped entirely with a
+  `WARN`-level log rather than proceeding into a wildcard delete.
+
+### Notes
+
+- **HPE's `Location` header format differs between firmware
+  releases**. Some return absolute URLs; some return paths. Any
+  Redfish client code that compares Location-derived strings against
+  `@odata.id` values needs a normalizer, not a `==`. Same rule as
+  the property-name-drift lessons (v0.1.42 `getSettings` vs
+  `getPluginConfig`, v0.1.45 `PowerDetail` vs `Samples`, v0.1.46
+  `Integer` where a `List` was expected): vendor responses evolve
+  faster than call sites assuming a specific shape.
+- **A "destructive" operation needs a belt-AND-suspenders invariant,
+  not a single filter**. v0.1.46's filter was correct in intent
+  (skip the current session) but relied on one string comparison
+  being right. v0.1.47 layers three independent checks — normalized
+  path match, id-tail match, and a hard cap on delete count. Even
+  if two of the three break in a future firmware quirk, no
+  wildcard-delete is possible. Cost: a dozen extra lines. Payoff:
+  the class of "we deleted our own credential and the tab shows
+  nothing" bugs is now closed regardless of what iLO does next.
+- **Every visible failure is easier to trace than a silent one.**
+  The v0.1.46 regression showed up as `iloSessions: 0 (cleaned 1
+  stale on login)` — the "cleaned 1" made the cause obvious in one
+  screenshot. If we hadn't been logging the cleaned-count, the
+  empty-tab symptom would have looked like a network or credential
+  failure and taken much longer to diagnose. Same forensics-first
+  pattern applies to every destructive operation: report what you
+  did, even when it "worked".
+
+## 0.1.46 — Stale session cleanup on login; power probe crash fix
+
+Two things. First, field testing on behemoth (DL320 Gen11, iLO 6
+v1.76) showed v0.1.45's `readMeter` closure throwing
+`java.lang.Integer.isEmpty()` on both probe endpoints — one of the two
+Redfish properties resolved to a non-List type (likely an integer
+count companion) and the downstream `if (pd && sm)` truthy check
+invoked `.isEmpty()` on it. Fully defensive `instanceof` checks
+close the door on that whole class of type-mismatch crash.
+
+Second, per the v0.1.41 documentation, each tab render creates two
+iLO sessions — one for `collectStatus` (properly torn down at
+end-of-render) and one via `acquireLaunchToken` (intentionally leaks
+so the sessionkey stays valid for the user's console click). The
+leaked sessions accumulate until iLO's ~30-minute idle reap kicks
+in. Combined with human operator activity on the same iLO account,
+the ~13-session pool saturates in an afternoon, and PATCH writes
+start failing with misleading `PropertyNotWritableOrUnknown` errors
+that look like RBAC problems but aren't. v0.1.46 clears our own
+stale sessions at login time so the pool never fills up from the
+plugin's side.
+
+### What changed
+
+- **Added.** `RedfishClient.cleanupOwnStaleSessions(String username)`
+  method. On collectStatus login, lists all iLO sessions, filters to
+  those whose `UserName` matches the credential we just authenticated
+  as, excludes the session we just created (matched by `@odata.id`
+  against `sessionLocation`), and issues `DELETE` on each remaining
+  match. Best-effort per-session — a single failed DELETE doesn't
+  abort cleanup of the rest, iLO's idle-reap will catch what we
+  couldn't. Returns the number of sessions deleted, which
+  collectStatus stashes on `result.sessionsCleanedUp` for
+  diagnostics. Critically, other users' sessions (iLO web UI,
+  administrators, other integrations) are NEVER touched — the filter
+  matches on `UserName == the credential we authenticated as`, so an
+  operator with a live IRC console up won't get bumped by a Morpheus
+  tab render.
+
+- **Fixed.** `readMeter` closure regression from v0.1.45 that threw
+  `java.lang.Integer.isEmpty()`. v0.1.46 replaces Groovy truthy-check
+  patterns (`if (pd && sm)`, `pd ?: sm`) with explicit `instanceof
+  List` guards and `.isEmpty()` calls on values we've confirmed are
+  Lists. Same for the inner sample-entry loop: `entry instanceof
+  Map` before any property access. The concrete shape of the iLO
+  response body no longer matters — anything we can't cleanly walk
+  as List-of-Maps is treated as absent and skipped.
+
+- **Added.** Diagnostics visibility on the meterProbes row now
+  includes the top-level keys of the response body when the probe
+  found 0 entries. Renders as `keys=[AveragePowerReading,
+  PowerDetail, ...]` right after the count. When a firmware
+  version returns a different shape than PowerDetail / Samples, this
+  row shows what we DID get in one render without a redeploy. Same
+  forensics-first pattern that unblocked settings (v0.1.40) and UID
+  (v0.1.39).
+
+- **Improved.** Diagnostics `iloSessions` row appends `(cleaned N
+  stale on login)` when v0.1.46 cleanup actually deleted sessions.
+  Silent when no cleanup happened, so unchanged wording on typical
+  renders. Makes the fix visible without needing to compare
+  side-by-side.
+
+### Notes
+
+- **Session leaks by design need explicit cleanup, not "iLO will
+  reap them".** The launch-token session leak was intentional in
+  v0.1.36 (sessionkey URL launch requires the session to outlive the
+  render), and iLO's ~30-minute idle reap covers the case where the
+  user never clicks Launch. But that reap is far too slow to keep up
+  with active use — multiple tab refreshes in a short window can
+  stack sessions faster than iLO clears them. The right pattern is
+  explicit best-effort cleanup on every fresh login: we already know
+  our own username, we can list sessions, we can filter to ones we
+  own, we can DELETE the ones that aren't the current session.
+  Nothing tricky and no risk to other users. Cost: two extra GETs
+  and a handful of DELETEs at the start of each render.
+- **Never touch other users' sessions.** The temptation when
+  cleaning up a shared iLO would be to kill every stale session
+  regardless of owner — but Morpheus is one integration among many,
+  and killing a live IRC console for an operator who happens to
+  authenticate as a different iLO user would be a much worse
+  outcome than a saturated pool. The filter has to be strictly on
+  `UserName == the credential we authenticated as`, and it has to be
+  visible in the code so a future maintainer can't accidentally
+  loosen it.
+- **Groovy truthy semantics on unknown types are dangerous.** The
+  v0.1.45 `if (pd && sm)` crash happened because `pm.PowerDetail`
+  resolved to something other than a List on this firmware, and
+  Groovy's `.asBoolean()` fallback path called `.isEmpty()` on it —
+  which Integer doesn't have. Defensive patterns matter more than
+  concise code when parsing untrusted vendor responses:
+  `instanceof` and explicit `.isEmpty()` on values we've confirmed
+  are Collections. Same rule applies to Redfish property access
+  broadly — vendor responses evolve across firmware revisions
+  without notice, and a "harmless" `if (thing)` becomes a runtime
+  crash the moment a scalar sneaks into what used to be an array.
+
+## 0.1.45 — Power Trend sparkline reads PowerDetail (iLO 6/7 property name)
+
+v0.1.44's FastPowerMeter fallback didn't fix the empty sparkline on
+DL320 Gen11 with iLO 6 v1.76. The field diagnostic (`powerTrend:
+source=EnvironmentMetrics, history=0 samples`) showed both probes
+were hitting the endpoints and returning zero samples. Turns out the
+plugin was reading the wrong property inside the response body:
+
+- iLO 5 uses `HpePowerMeter.Samples[]` with `Time`, `Average`, `Maximum`.
+- iLO 6 / iLO 7 renamed the array to `HpePowerMeter.PowerDetail[]`
+  with `Time`, `Average`, `Peak` (replacement for `Maximum`),
+  `Minimum` (new), plus per-component fields `CpuWatts`,
+  `DimmWatts`, `GpuWatts`, `SharedFanWatts`.
+
+Reference: iLO 7 changelog `HpePowerMeter.v2_1_0` → `v2_2_0` adds
+`PowerDetail[{item}].SharedFanWatts`. Confirmed against a real-world
+PowerShell script from HPE's community forum that pulls `powerdetail`
+from `/redfish/v1/chassis/1/power/fastpowermeter`.
+
+The plugin was reading `pm.Samples` on iLO 6, where the field is
+`pm.PowerDetail`. Groovy's map access returned null, closure returned
+null, both probes recorded zero samples, sparkline stayed blank.
+
+### What changed
+
+- **Fixed.** `readMeter` closure now reads both property shapes:
+  `PowerDetail` (iLO 6/7, preferred) with `Samples` (iLO 5) as
+  fallback. Per-entry field mapping: `Average` unchanged, `Peak` or
+  `Maximum` → trend max, `Minimum` (PowerDetail only) → trend min.
+  When PowerDetail carries a per-entry `Minimum` it takes precedence
+  over the derived min-of-averages we've been computing on iLO 5.
+- **Improved.** New `meterProbes` Diagnostics row shows each probe's
+  URL and entry count (or -1 for HTTP null). Format:
+  `/Power/PowerMeter: 0 entries · /Power/FastPowerMeter: 60 entries`.
+  Row only appears when at least one probe was attempted so it stays
+  out of the way on hardware where the first-hit probe succeeds. The
+  short-path rewrite drops the redundant `/redfish/v1/Chassis/1`
+  prefix so the row fits on a single line.
+- **Improved.** Empty-state message on the Power Trend card is now
+  driven by whether ANY meterProbe returned entries — if all probes
+  returned 0 or -1, the card explicitly says which URLs were tried,
+  which turns future variance into a one-render diagnostic.
+
+### Notes
+
+- **HPE renamed a Redfish property between iLO 5 and iLO 6.** Not
+  deprecated, not aliased — the old name (`Samples`) is just gone on
+  iLO 6/7, replaced by a differently-named array (`PowerDetail`)
+  that carries additional per-component fields. Plugin code that
+  worked on iLO 5 silently returns no data on iLO 6 without any HTTP
+  error. Always read the target firmware's actual resource
+  definition, not just an earlier version's — the resource map lists
+  the type name but not the field names inside, and the field names
+  are where the version drift lives.
+- **This is the same shape as v0.1.42's `getSettings` fix.** In both
+  cases the previous release "found the right endpoint" but "read
+  the wrong property" — different Morpheus / iLO version conventions
+  than the plugin was written against. The forensics-first pattern
+  (surface what the probe returned, not just what the caller decided)
+  caught both in one round after adding the diagnostic. The
+  `meterProbes` row is the direct analog of the `settingsRaw` row.
+- **HPE community forums are a valid source of ground truth for
+  Redfish property names.** The PowerShell snippet using
+  `.powerdetail` in a working script confirmed the property name
+  faster than parsing HPE's schema docs. When HPE's own docs are
+  ambiguous about which properties are populated on which firmware,
+  code samples from actual field use are worth searching for.
+
+## 0.1.44 — Power Trend sparkline reads FastPowerMeter as fallback
+
+Field report from a DL320 Gen11 with iLO 6 v1.76: the Power Trend
+card showed "No history available" even though iLO's own web UI had
+a fully-populated 20-Minute History Graph with CPU/Fan/GPU/DIMM
+breakdowns. HPE's iLO 6 v1.68+ resource map documents TWO peer
+endpoints returning the same `HpePowerMeter` type:
+
+- `/redfish/v1/Chassis/1/Power/PowerMeter` — longer-term history
+  (24-hour on firmware that populates it)
+- `/redfish/v1/Chassis/1/Power/FastPowerMeter` — 20-minute
+  high-resolution samples (what the iLO web UI's "20-Minute History
+  Graph" reads from)
+
+The plugin's Power Trend card only read the first. On firmware /
+hardware combinations that only populate FastPowerMeter — which
+includes DL320 Gen11 on iLO 6 v1.76 — the sparkline stayed empty
+even though the data existed.
+
+### What changed
+
+- **Fixed.** Power Trend sparkline reads `/Power/FastPowerMeter` as
+  a fallback when `/Power/PowerMeter` doesn't return samples. Both
+  endpoints emit the same `HpePowerMeter` type per HPE's own resource
+  map, so the parsing code is identical — only the URL differs. The
+  `trend.source` field tags the diagnostics with which endpoint the
+  data came from (`PowerMeter` vs `FastPowerMeter` vs
+  `EnvironmentMetrics+PowerMeter` combos), so it's obvious from the
+  tab which source populated the card. Empty-state message reworded
+  to mention both endpoints so future 0-sample cases don't send
+  people looking at the wrong URL.
+
+### Notes
+
+- **HPE ships peer Redfish endpoints returning the same OEM type with
+  different retention windows.** The `HpePowerMeter` type is
+  documented once but instantiated at two URIs
+  (`/Power/PowerMeter` and `/Power/FastPowerMeter`), and which one
+  is populated depends on firmware/hardware tier. Always probe both
+  when reading HPE OEM history data — the pattern generalizes to
+  other paired endpoints in the resource map.
+- **iLO web UI is a spec: if the value shows there, some Redfish
+  endpoint returns it.** The DL320 Gen11 report followed the same
+  pattern as the earlier UID debugging — the iLO web UI displayed
+  the data, so the property/endpoint existed somewhere, we just
+  weren't reading the right one. Whenever the plugin fails to read
+  something that iLO's own UI shows, the first debugging step is to
+  find the alternate endpoint in HPE's resource map rather than
+  assume the value isn't available.
+
 ## 0.1.43 — Release prep: privilege docs corrected, README freshened, posting artifacts added
 
 Polish-only release ahead of the GitHub push. Field testing on the same

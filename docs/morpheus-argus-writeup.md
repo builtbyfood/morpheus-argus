@@ -53,6 +53,7 @@ that's already stored in Morpheus's Trust → Credentials.
 
 > [![iLO-Tab2](screenshots/ilo-details2.png)]
 > [![iLO-Tab3](screenshots/ilo-details3.png)]
+> [![iLO-Tab4](screenshots/ilo-details4.png)]
 
 Every card is independent. If one Redfish endpoint is missing, slow, or
 returns malformed data, that card alone is skipped — the rest of the
