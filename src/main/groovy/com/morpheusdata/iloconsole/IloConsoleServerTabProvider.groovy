@@ -45,7 +45,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
             log.info("iLO show() called — server id=${safeId(server)} name=${safeName(server)} user=${user?.username}")
             if (server == null) return false
             IloDetectionService detection = ((IloConsolePlugin) plugin).detectionService
-            boolean result = detection?.matchesHpeProliant(server) ?: false
+            boolean result = detection?.matchesHpeIlo(server) ?: false
             log.info("iLO show() returning ${result}")
             return result
         } catch (Throwable t) {
@@ -1648,7 +1648,7 @@ class IloConsoleServerTabProvider extends AbstractServerTabProvider {
 
             // Diagnostics (collapsed by default)
             html.append('<details style="background:var(--argus-bg-diag); padding:10px 14px; border-radius:4px; margin-top:14px;">')
-            html.append('<summary style="cursor:pointer; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; opacity:0.5;">Diagnostics (v0.1.47)</summary>')
+            html.append('<summary style="cursor:pointer; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; opacity:0.5;">Diagnostics (v0.1.49)</summary>')
             html.append('<table style="font-family:monospace; font-size:11px; width:100%; margin-top:10px;">')
             diag.each { k, v ->
                 html.append("<tr><td style=\"opacity:0.55; padding-right:24px; padding-bottom:2px;\">${escapeHtml(k as String)}</td><td>${escapeHtml(v?.toString())}</td></tr>")

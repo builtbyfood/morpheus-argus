@@ -1,4 +1,4 @@
-# morpheus-argus v0.1.43
+# morpheus-argus v0.1.48
 
 > Drop the JAR into Morpheus, get a live iLO panel on every HPE
 > ProLiant host detail page plus one-click pre-authenticated console
@@ -8,7 +8,7 @@ This release consolidates ten iterations of operational hardening on
 top of the v0.1.34 feature complete (Power Trend / Network Adapters /
 NIC Port LEDs / Volumes & RAID). v0.1.35 added user-facing polish,
 v0.1.36 added pre-authenticated sessionkey URL console launch,
-v0.1.38 added UID indicator LED control, and v0.1.39 → v0.1.43 hardened
+v0.1.38 added UID indicator LED control, and v0.1.39 → v0.1.48 hardened
 that control across HPE firmware variance and Morpheus plugin-api
 quirks based on direct field testing. The result is a single drop-in
 JAR that "just works" on Morpheus 9.0 with iLO 5 / iLO 6 / iLO 7
@@ -86,7 +86,7 @@ reads cleanly against both Morpheus's dark and light themes
 
 ## Install
 
-1. Build: `./gradlew clean shadowJar` → `build/libs/morpheus-argus-0.1.43-all.jar`
+1. Build: `./gradlew clean shadowJar` → `build/libs/morpheus-argus-0.1.48-all.jar`
 2. Upload: **Administration → Integrations → Plugins → Upload Plugin**
 3. Confirm in log: `tail -F /var/log/morpheus/morpheus-ui/current | grep -i ilo`
 4. Configure per-host via labels: `ilo-host:<ip>`, `ilo-cred:<credential-id>`,
@@ -124,7 +124,7 @@ around OptionType registrations and plugin metadata.
 ## Detailed changelog
 
 See `docs/CHANGELOG.md` for the full version-by-version trace
-including every operational lesson learned in the v0.1.36 → v0.1.43
+including every operational lesson learned in the v0.1.36 → v0.1.48
 hardening sequence. Highlights:
 
 - **v0.1.42**: settings actually load (RxJava 3 `blockingGet()`, not

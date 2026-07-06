@@ -26,7 +26,7 @@ import groovy.util.logging.Slf4j
 @Slf4j
 class IloConsolePlugin extends Plugin {
 
-    public static final String VERSION = "0.1.47"
+    public static final String VERSION = "0.1.49"
 
     IloConfigStore configStore
     IloDetectionService detectionService
@@ -42,7 +42,7 @@ class IloConsolePlugin extends Plugin {
         this.renderer = new HandlebarsRenderer()
 
         this.setName("iLO")
-        this.setDescription("HPE iLO console and Redfish status panel for ProLiant hosts. v${VERSION}.")
+        this.setDescription("HPE iLO console and Redfish status panel for iLO-managed HPE servers (ProLiant, Synergy, Apollo, and more). v${VERSION}.")
         this.setAuthor("builtbyfood")
         this.setSourceCodeLocationUrl("https://github.com/builtbyfood/morpheus-ilo-console")
         this.setIssueTrackerUrl("https://github.com/builtbyfood/morpheus-ilo-console/issues")

@@ -5,7 +5,7 @@
 > Morpheus's admin list, and the page header all read "iLO". The "Argus"
 > name lives in the repo, the JAR file, and the docs. See *Naming* below.
 
-A Morpheus 9.0 plugin that adds an **iLO** tab to HPE ProLiant host detail
+A Morpheus 9.0 plugin that adds an **iLO** tab to HPE server host detail
 pages. It reads live status from the iLO via Redfish — power, health,
 thermals, fans, PSU, network identity, drives, DIMMs, recent events,
 active sessions — exposes the configured credentials for copy/paste, and
@@ -29,7 +29,7 @@ If you build the source, the JAR comes out as `morpheus-argus-0.1.x-all.jar`.
 
 | Surface | Where |
 | --- | --- |
-| **iLO** tab | Infrastructure → Compute → Hosts → *any HPE ProLiant host* |
+| **iLO** tab | Infrastructure → Compute → Hosts → *any HPE host with iLO* (ProLiant, Synergy, Apollo, BladeSystem, Edgeline, Alletra 4000/5000/6000, Cray XD, Superdome Flex, or any host labeled `ilo-host:<ip>`) |
 | **System** card | Power state · Health · iLO model + firmware · BIOS version · CPU · Memory · Serial · Asset Tag · SKU · **UID indicator LED** state + Off / Lit / Blink control buttons · **TPM** · **Boot Progress** · **Boot Override** · **Hostname** |
 | **Power & Cooling** card | Current power draw (with average fallback) · PSU count + redundancy · hottest CPU temperature · ambient temperature · fan summary. Temperatures shown as °C / °F (zero-config, international-friendly). |
 | **Network** card | Host MAC + IP + link status · iLO's own MAC + IP + hostname/FQDN · **iLO date/time** · **iLO license type** |
@@ -54,8 +54,30 @@ Tested against:
 
 - Morpheus 9.0.0 / plugin-api 1.3.1 (RxJava 3 runtime)
 - HPE ProLiant MicroServer Gen10 Plus (iLO 5) and Gen11 (iLO 6 v1.74)
+- HPE ProLiant DL320 Gen11 (iLO 6 v1.76)
 - HPE ProLiant Compute DL325 Gen12 (iLO 7 v1.22.00)
 - Chrome 130+, Firefox 130+, Brave 1.70+
+
+Auto-detected HPE server families (host gets the iLO tab automatically):
+
+- **ProLiant** — traditional rack (DL), tower (ML), blade (BL), MicroServer
+- **Synergy** — composable compute modules
+- **Apollo** — HPC / dense compute chassis
+- **BladeSystem** — legacy blade infrastructure
+- **Edgeline** — edge / remote-office servers
+- **MicroServer** — sometimes reported without the "ProLiant" prefix
+- **Alletra** — Alletra 4000 / 5000 / 6000 compute (Alletra 9000 storage arrays don't have iLO and are not shown)
+- **Cray XD** — HPE Cray XD supercomputer nodes
+- **Superdome Flex/X** — mission-critical compute nodes
+
+For an HPE host that isn't auto-detected — a future HPE family we
+haven't listed yet, or a host where Morpheus knows the model is HPE
+but not which family — attach the label `ilo-host:<ip-or-hostname>`
+and the tab will render. **The label bypasses the model-token check
+but not the HPE vendor check**: non-HPE hardware (Dell iDRAC, Cisco
+CIMC, Supermicro IPMI, etc.) never gets the iLO tab, regardless of
+what labels are attached. That's intentional — this plugin is
+specifically for HPE iLO.
 
 ---
 
@@ -64,7 +86,7 @@ Tested against:
 1. **Build** the JAR locally:
    ```bash
    ./gradlew clean shadowJar
-   # output: build/libs/morpheus-argus-0.1.43-all.jar
+   # output: build/libs/morpheus-argus-0.1.49-all.jar
    ```
    Requires JDK 17 (produces Java 11 bytecode).
 
@@ -78,7 +100,7 @@ Tested against:
    ```
    You should see:
    ```
-   INFO  c.m.i.IloConsolePlugin - iLO Console plugin 0.1.43 initialized
+   INFO  c.m.i.IloConsolePlugin - iLO Console plugin 0.1.49 initialized
                                   (custom HandlebarsRenderer, no controller routes)
    ```
 

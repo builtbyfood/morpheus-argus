@@ -5,18 +5,73 @@ what's actually happening underneath and what to change.
 
 ---
 
+## Launch Console opens iLO's login page instead of the console (iLO 6 v1.76+)
+
+If you click **Launch Console** and iLO shows its Local login name /
+Password prompt instead of the HTML5 IRC, and the browser URL clearly
+contains `?sessionkey=<32-hex-char-value>` (i.e. the token IS in the
+URL, iLO is just ignoring it), you're on iLO 6 firmware v1.76 or
+later. HPE tightened URL-based authentication in that release —
+`/irc.html?sessionkey=X` no longer accepts a Redfish token as a
+one-shot login. iLO's page JavaScript silently drops the parameter
+and shows the login form.
+
+**Confirming.** Open the browser's Network devtools before clicking
+Launch Console. On the request that follows the redirect to
+`/irc.html`, look at the request headers: `X-Auth-Token: null`. That
+null token is iLO's own JS reporting it couldn't extract a session
+from the URL. If the parameter were being consumed, this would carry
+the sessionkey value.
+
+**Fix on iLO 6 v1.76 and later.** Uncheck **Console: Use Sessionkey
+URL Authentication** in **Administration → Plugins → iLO → Settings**
+and save. Clear browser cache (iLO's earlier page's cached JS can
+also cause this). Refresh the iLO tab. The plugin will fall back to
+the v0.1.35 cookie POST flow, which continues to work on this
+firmware — the Launch Console button will submit an HTML form to
+`/json/login_session`, iLO will set a `sessionKey` cookie, and the
+popup will navigate to `/irc.html` carrying that cookie. Auto-login
+succeeds via the cookie.
+
+**Why not just default to cookie everywhere.** Older iLO (iLO 5 /
+iLO 6 v1.74 and earlier) works fine with the sessionkey URL path —
+it's actually preferable because it's stateless (no cookie race)
+and works cleanly across popup vs tab launch modes. Forcing every
+host onto cookie POST would slightly degrade the launch UX for the
+majority of fleets. A future release will fingerprint iLO's firmware
+version and auto-select the right flow.
+
+**Diagnostics rows to check.** `launchAuthResolved` shows which flow
+we picked (`sessionkey` or `cookie`). If it's `sessionkey` and Launch
+isn't working, that's the setting to flip.
+
 ## The iLO Console tab doesn't appear on the host detail page
 
-**What `show()` checks.** `IloConsoleServerTabProvider.show(server, …)`
-returns `true` if any of these are true:
+**What `show()` checks (v0.1.49+).** `IloConsoleServerTabProvider.show(server, …)`
+returns `true` only when **both** are true:
 
-1. The server's `name` contains `ilo` (case-insensitive).
-2. The server's `description` contains `ilo` (case-insensitive).
-3. The server has a label starting with `ilo-host:`.
-4. The server's `serverType.code` matches a known HPE type.
+1. **HPE hardware.** The server's `vendor` field contains an HPE
+   variant (`HPE`, `HP`, `Hewlett Packard Enterprise`,
+   `Hewlett-Packard`) OR the `model` field contains a known HPE
+   family token. This gate is strict — non-HPE hardware (Dell,
+   Cisco, Supermicro, etc.) never gets the tab, even if it's been
+   mislabeled with `ilo-host:`.
+2. **iLO-managed identifier.** Either the `model` field contains a
+   known iLO family token — `proliant`, `synergy`, `apollo`,
+   `bladesystem`, `edgeline`, `microserver`, `alletra`,
+   `cray xd`, or `superdome` — OR the server has an explicit
+   `ilo-host:<ip>` label attached (the opt-in path for HPE families
+   not in the token list).
 
-If none match, the tab is hidden. Add an `ilo-host:` label to force it
-visible (see *Configuration* in the README).
+If either gate fails, the tab is hidden. **Fix for an HPE host that's
+not showing**: confirm the vendor field is set to HPE in Morpheus,
+then attach an `ilo-host:<ip-or-hostname>` label. That covers HPE
+families we haven't listed yet.
+
+**Fix for a non-HPE host mistakenly showing (shouldn't happen in
+v0.1.49+, but if you observe it):** the vendor field is probably set
+to "HPE" by mistake. Correct it in Morpheus; the tab will disappear
+on next render.
 
 **Verify the plugin loaded.** Tail the Morpheus log while uploading:
 
@@ -27,7 +82,7 @@ tail -F /var/log/morpheus/morpheus-ui/current | grep -i ilo
 You should see:
 
 ```
-INFO  c.m.i.IloConsolePlugin - iLO Console plugin 0.1.34 initialized
+INFO  c.m.i.IloConsolePlugin - iLO Console plugin 0.1.48 initialized
    (custom HandlebarsRenderer, no controller routes)
 ```
 
@@ -40,6 +95,13 @@ about hot-replacing a JAR. If you uploaded a new version on top of an
 old one and behavior looks stale, do a full uninstall: **Administration
 → Integrations → Plugins → iLO Console → Uninstall**, then upload the
 new JAR fresh.
+
+**Auto-detect not working on an HPE family I know has iLO.** If the
+server is definitely HPE + iLO-managed and the tab isn't showing (for
+example, an HPE family we haven't listed), attach an `ilo-host:<ip>`
+label as the immediate workaround, and file an issue with the exact
+values of `hardwareProductVendor` and `hardwareProductName` from
+Morpheus's server detail page so the auto-detect list can be updated.
 
 ---
 

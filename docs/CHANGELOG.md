@@ -4,6 +4,159 @@ All notable changes to the `morpheus-ilo-console` plugin. The version numbers
 trace the actual iteration history; lessons learned at each step are summarized
 in the `Notes` rows because they explain why the next version exists.
 
+## 0.1.49 — Tighten HPE-only gate: label opt-in no longer overrides vendor check
+
+v0.1.48's `hasIloOptInLabel` path was too permissive. As shipped, an
+`ilo-host:<ip>` label on ANY host — HPE, Dell iDRAC, Cisco CIMC,
+Supermicro IPMI, anything — would show the iLO tab. That defeated
+the point of the vendor gate: the plugin is specifically for HPE
+iLO, and a broken iLO tab on a Dell PowerEdge is worse than no tab
+at all.
+
+### What changed
+
+- **Fixed.** `matchesHpeIlo()` now enforces a strict two-gate
+  check:
+    1. Must have an HPE signal — vendor field contains an HPE
+       variant OR model field contains a known HPE identifier.
+       Non-HPE hardware never passes this gate regardless of
+       labels.
+    2. Given HPE is confirmed, either the model contains a known
+       iLO-family token (auto-detect), OR the host has an
+       `ilo-host:X` label (opt-in for HPE families we haven't
+       listed yet). The label bypasses the family-token check but
+       not the HPE check.
+- **Updated.** README and TROUBLESHOOTING wording clarified. The
+  label is described as "for an HPE host that isn't auto-detected"
+  and calls out explicitly that "non-HPE hardware (Dell iDRAC,
+  Cisco CIMC, Supermicro IPMI, etc.) never gets the iLO tab,
+  regardless of what labels are attached." No wiggle room in the
+  docs about that.
+
+### Notes
+
+- **A label alone should never bypass a category check.** The
+  category here is "hardware family we intend to support" —
+  specifically HPE iLO. The label's purpose is to help pinpoint
+  *which* iLO within that category, not to override the category
+  itself. Same rule applies to any capability gate: labels can
+  specialize a category match, not substitute for one.
+- **"Cluttering someone else's host detail page with a broken tab"
+  is a real cost.** An empty iLO tab on a Dell iDRAC host would
+  confuse operators, generate support tickets, and undermine trust
+  in the plugin's intent. Absence of harm on the working case
+  (label helps HPE families not yet in our token list) does not
+  license harm on the broken case (label breaks non-HPE hosts).
+  The strict two-gate check keeps both properties: helpful on HPE,
+  invisible on everything else.
+- **v0.1.48 shipped with this bug in the code and in the docs.**
+  I described the label as an unconditional override in both the
+  class-level Javadoc and the README, and implemented it that way.
+  The right question ("does this show up on Dell too?") caught it
+  before wider testing. Worth internalizing: any time an escape
+  hatch is added to a filter, immediately ask "what's the failure
+  mode when someone uses the escape hatch on the wrong side of the
+  filter?"
+
+## 0.1.48 — Broadened hardware recognition beyond ProLiant; documented iLO 6 v1.76 sessionkey behavior
+
+Two additions from field feedback. First, the tab's `show()` gate was
+matching only hosts whose Morpheus-reported model contained
+`proliant`. iLO ships on many more HPE server families than ProLiant
+alone — Synergy compute modules, Apollo HPC, BladeSystem, Edgeline,
+Alletra 4000/5000/6000 compute, Cray XD, Superdome Flex/X nodes,
+plus MicroServer variants that some Morpheus discovery paths report
+without the ProLiant prefix. Users running these families were
+seeing the plugin loaded but no tab.
+
+Second, we now have a field-confirmed answer for the iLO 6 v1.76
+sessionkey URL failure that surfaced during v0.1.47 testing: HPE
+silently dropped support for `/irc.html?sessionkey=<X-Auth-Token>`
+in that firmware revision, likely as a security hardening step
+(URL-embedded credentials leak into browser history, referer
+headers, and proxy logs). The plugin's existing cookie POST fallback
+continues to work on this firmware — users just need to uncheck the
+sessionkey URL setting. Documented that with a browser-devtools
+signature so the next person hits diagnosis in seconds.
+
+### What changed
+
+- **Added.** `IloDetectionService.matchesHpeIlo()` replaces
+  `matchesHpeProliant()`. The old method is retained as a
+  `@Deprecated` alias so anything calling it externally still works.
+  The new method matches any of nine model tokens (`proliant`,
+  `synergy`, `apollo`, `bladesystem`, `edgeline`, `microserver`,
+  `alletra`, `cray xd`, `superdome`) in addition to the existing
+  HPE vendor check.
+
+- **Added.** Explicit label-based opt-in. Any host with an
+  `ilo-host:<ip>` label now passes the `show()` gate regardless of
+  what Morpheus's vendor/model fingerprint reports. This covers
+  future HPE families we haven't listed yet, hosts where Morpheus's
+  hardware detection is missing (e.g. bare imports without an SMBIOS
+  probe), and edge cases where the model string doesn't quite fit
+  any token. Users opt in explicitly by attaching the label they'd
+  attach anyway to point the plugin at their iLO — no extra
+  configuration step.
+
+- **Added.** New TROUBLESHOOTING section
+  *"Launch Console opens iLO's login page instead of the console
+  (iLO 6 v1.76+)"*. Walks through the browser-devtools signature
+  (`X-Auth-Token: null` on requests after landing on `/irc.html`,
+  iLO loading `/html/login_session` instead of the console) that
+  identifies this failure mode versus a generic auth problem.
+  Explains the fix: uncheck **Use Sessionkey URL Authentication** in
+  plugin settings, clear browser cache, refresh. Notes that cookie
+  POST continues to work on this firmware.
+
+- **Improved.** README opens the tested-against list beyond
+  ProLiant. New "Auto-detected HPE server families" section lists
+  each family, what it corresponds to (rack, blade, dense compute,
+  etc.), and calls out that the `ilo-host:` label handles anything
+  outside the list. Install snippet updated to v0.1.48.
+
+- **Improved.** Plugin description in the Morpheus admin UI now
+  reads *"HPE iLO console and Redfish status panel for
+  iLO-managed HPE servers (ProLiant, Synergy, Apollo, and more)"*
+  instead of "for ProLiant hosts."
+
+- **Improved.** TROUBLESHOOTING "iLO Console tab doesn't appear"
+  section rewritten to match v0.1.48's actual gating logic — two
+  paths (label opt-in wins; auto-detect via vendor + model token)
+  rather than the older four-check list which described earlier
+  behavior. Includes a workaround suggestion for HPE families we
+  haven't listed yet (add `ilo-host:`, file an issue with the
+  vendor/model strings).
+
+### Notes
+
+- **Auto-detect is a helpful default, not a security gate.** The
+  plugin's actual power (reading iLO, launching console, PATCHing
+  UID) only activates once the user attaches `ilo-cred:<id>` and
+  `ilo-host:<ip>` labels; without those, an incorrectly-shown tab
+  just renders an "unconfigured" state. That means the vendor/model
+  match is best-effort — being too permissive is much less costly
+  than being too restrictive. A user who has to add a label to see
+  the tab has done more work than a user who sees an unconfigured
+  tab.
+- **Explicit label opt-in beats fingerprint matching for future-
+  proofing.** Every time HPE adds a server family or renames a
+  product line, our fingerprint list would need updating. The
+  `ilo-host:` label sidesteps that entirely — the user telling us
+  "this host has iLO at 192.168.x.x" is a more reliable signal
+  than any hardware string HPE might rebrand. Fingerprinting stays
+  as the zero-config default; labels are the escape hatch.
+- **iLO 6 v1.76's sessionkey drop is a case where HPE's docs are
+  silent but browser devtools tells the whole story.** No changelog
+  entry, no deprecation notice — just a firmware upgrade after
+  which URL-embedded sessionkeys stop working. The signature
+  (`X-Auth-Token: null` on the follow-up XHR) is unambiguous once
+  you know to look for it. That's the pattern to document loudly:
+  when a black-box firmware change breaks a feature, the
+  troubleshooting page should include the specific network-trace
+  signature that identifies it, so the next person doesn't burn
+  time on cleanup / credentials / cookies theories.
+
 ## 0.1.47 — Session cleanup fix: normalize path comparison so we don't delete our own session
 
 v0.1.46 introduced `cleanupOwnStaleSessions()` to keep the iLO session
